@@ -1,0 +1,5854 @@
+diff -urN linux.orig/drivers/media/dvb-frontends/Kconfig linux/drivers/media/dvb-frontends/Kconfig
+--- linux.orig/drivers/media/dvb-frontends/Kconfig	2024-08-04 19:51:34.351240752 +0100
++++ linux/drivers/media/dvb-frontends/Kconfig	2024-08-04 19:59:17.194559585 +0100
+@@ -77,6 +77,13 @@
+ 
+ 	  Say Y when you want to support these frontends.
+ 
++config DVB_TAS2101
++	tristate "Tmax TAS2101 based"
++	depends on DVB_CORE && I2C
++	default m if !MEDIA_SUBDRV_AUTOSELECT
++	help
++	Say Y when you want to support this frontend.
++
+ comment "Multistandard (cable + terrestrial) frontends"
+ 	depends on DVB_CORE
+ 
+diff -urN linux.orig/drivers/media/dvb-frontends/Makefile linux/drivers/media/dvb-frontends/Makefile
+--- linux.orig/drivers/media/dvb-frontends/Makefile	2024-08-04 19:51:34.351240752 +0100
++++ linux/drivers/media/dvb-frontends/Makefile	2024-08-04 19:59:37.342702476 +0100
+@@ -75,6 +75,7 @@
+ obj-$(CONFIG_DVB_MB86A16) += mb86a16.o
+ obj-$(CONFIG_DVB_MB86A20S) += mb86a20s.o
+ obj-$(CONFIG_DVB_MN88443X) += mn88443x.o
++obj-$(CONFIG_DVB_TAS2101) += tas2101.o
+ obj-$(CONFIG_DVB_MN88472) += mn88472.o
+ obj-$(CONFIG_DVB_MN88473) += mn88473.o
+ obj-$(CONFIG_DVB_MT312) += mt312.o
+diff -urN linux.orig/drivers/media/dvb-frontends/tas2101.c linux/drivers/media/dvb-frontends/tas2101.c
+--- linux.orig/drivers/media/dvb-frontends/tas2101.c	1970-01-01 01:00:00.000000000 +0100
++++ linux/drivers/media/dvb-frontends/tas2101.c	2024-08-04 19:57:02.285597980 +0100
+@@ -0,0 +1,958 @@
++/*
++    Tmax TAS2101 - DVBS/S2 Satellite demodulator driver
++
++    Copyright (C) 2014 Luis Alves <ljalvs@gmail.com>
++
++    This program is free software; you can redistribute it and/or modify
++    it under the terms of the GNU General Public License as published by
++    the Free Software Foundation; either version 2 of the License, or
++    (at your option) any later version.
++
++    This program is distributed in the hope that it will be useful,
++    but WITHOUT ANY WARRANTY; without even the implied warranty of
++    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++    GNU General Public License for more details.
++
++    You should have received a copy of the GNU General Public License
++    along with this program; if not, write to the Free Software
++    Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
++*/
++
++#include <linux/slab.h>
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/moduleparam.h>
++#include <linux/init.h>
++#include <linux/i2c-mux.h>
++#include <linux/version.h>
++
++#include <media/dvb_frontend.h>
++
++#include "tas2101.h"
++#include "tas2101_priv.h"
++
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 7, 0)
++#if IS_ENABLED(CONFIG_I2C_MUX)
++// #define TAS2101_USE_I2C_MUX
++#endif
++#endif
++
++/* return i2c adapter */
++/* bus = 0   master   */
++/* bus = 1   demod    */
++/* bus = 2   tuner    */
++struct i2c_adapter *tas2101_get_i2c_adapter(struct dvb_frontend *fe, int bus)
++{
++	struct tas2101_priv *priv = fe->demodulator_priv;
++	switch (bus) {
++	case 0:
++	default:
++		return priv->i2c;
++	case 1:
++		return priv->i2c_demod;
++	case 2:
++		return priv->i2c_tuner;
++	}
++}
++EXPORT_SYMBOL_GPL(tas2101_get_i2c_adapter);
++
++/* write multiple (continuous) registers */
++/* the first value is the starting address */
++static int tas2101_wrm(struct tas2101_priv *priv, u8 *buf, int len)
++{
++	int ret;
++	struct i2c_msg msg = {
++		.addr = priv->cfg->i2c_address,
++		.flags = 0, .buf = buf, .len = len };
++
++	dev_dbg(&priv->i2c->dev, "%s() i2c wrm @0x%02x (len=%d)\n",
++		__func__, buf[0], len);
++
++	ret = i2c_transfer(priv->i2c_demod, &msg, 1);
++	if (ret < 0) {
++		dev_warn(&priv->i2c->dev,
++			"%s: i2c wrm err(%i) @0x%02x (len=%d)\n",
++			KBUILD_MODNAME, ret, buf[0], len);
++		return ret;
++	}
++	return 0;
++}
++
++/* write one register */
++static int tas2101_wr(struct tas2101_priv *priv, u8 addr, u8 data)
++{
++	u8 buf[] = { addr, data };
++	return tas2101_wrm(priv, buf, 2);
++}
++
++/* read multiple (continuous) registers starting at addr */
++static int tas2101_rdm(struct tas2101_priv *priv, u8 addr, u8 *buf, int len)
++{
++	int ret;
++	struct i2c_msg msg[] = {
++		{ .addr = priv->cfg->i2c_address, .flags = 0,
++			.buf = &addr, .len = 1 },
++		{ .addr = priv->cfg->i2c_address, .flags = I2C_M_RD,
++			.buf = buf, .len = len }
++	};
++
++	dev_dbg(&priv->i2c->dev, "%s() i2c rdm @0x%02x (len=%d)\n",
++		__func__, addr, len);
++
++	ret = i2c_transfer(priv->i2c_demod, msg, 2);
++	if (ret < 0) {
++		dev_warn(&priv->i2c->dev,
++			"%s: i2c rdm err(%i) @0x%02x (len=%d)\n",
++			KBUILD_MODNAME, ret, addr, len);
++		return ret;
++	}
++	return 0;
++}
++
++/* read one register */
++static int tas2101_rd(struct tas2101_priv *priv, u8 addr, u8 *data)
++{
++	return tas2101_rdm(priv, addr, data, 1);
++}
++
++static int tas2101_regmask(struct tas2101_priv *priv,
++	u8 reg, u8 setmask, u8 clrmask)
++{
++	int ret;
++	u8 b = 0;
++	if (clrmask != 0xff) {
++		ret = tas2101_rd(priv, reg, &b);
++		if (ret)
++			return ret;
++		b &= ~clrmask;
++	}
++	return tas2101_wr(priv, reg, b | setmask);
++}
++
++static int tas2101_wrtable(struct tas2101_priv *priv,
++	struct tas2101_regtable *regtable, int len)
++{
++	int ret, i;
++
++	for (i = 0; i < len; i++) {
++		ret = tas2101_regmask(priv, regtable[i].addr,
++			regtable[i].setmask, regtable[i].clrmask);
++		if (ret)
++			return ret;
++		if (regtable[i].sleep)
++			msleep(regtable[i].sleep);
++	}
++	return 0;
++}
++
++static int tas2101_read_status(struct dvb_frontend *fe, enum fe_status *status)
++{
++	struct tas2101_priv *priv = fe->demodulator_priv;
++	struct dtv_frontend_properties *c = &fe->dtv_property_cache;
++	int ret, i;
++	long val;
++	u16 raw;
++	u8 buf[2];
++
++	*status = 0;
++
++	ret = tas2101_rd(priv, DEMOD_STATUS, buf);
++	if (ret)
++		return ret;
++
++	buf[0] &= DEMOD_STATUS_MASK;
++	if (buf[0] == DEMOD_LOCKED) {
++		*status = FE_HAS_SIGNAL | FE_HAS_CARRIER |
++			FE_HAS_VITERBI | FE_HAS_SYNC | FE_HAS_LOCK;
++
++		ret = tas2101_rd(priv, REG_04, buf);
++		if (ret)
++			return ret;
++		if (buf[0] & 0x08)
++			ret = tas2101_wr(priv, REG_04, buf[0] & ~0x08);
++	}
++
++	val = -1000;
++	c->strength.len = 1;
++	c->strength.stat[0].scale = FE_SCALE_NOT_AVAILABLE;
++
++	/* Read signal strength */
++	ret = tas2101_rdm(priv, SIGSTR_0, buf, 2);
++	if (ret)
++		return ret;
++
++	raw = (((u16)buf[1] & 0xf0) << 4) | buf[0];
++
++	for (i = 0; i < ARRAY_SIZE(tas2101_dbmtable) - 1; i++)
++		if (tas2101_dbmtable[i].raw < raw)
++			break;
++	if( i == 0 )
++		val = tas2101_dbmtable[i].dbm;
++	else
++	{
++		/* linear interpolation between two calibrated values */
++		val = (raw - tas2101_dbmtable[i].raw) * tas2101_dbmtable[i-1].dbm;
++		val += (tas2101_dbmtable[i-1].raw - raw) * tas2101_dbmtable[i].dbm;
++		val /= (tas2101_dbmtable[i-1].raw - tas2101_dbmtable[i].raw);
++	}
++
++	c->strength.len = 2;
++	c->strength.stat[0].scale = FE_SCALE_DECIBEL;
++	c->strength.stat[0].svalue = val *100;
++
++	c->strength.stat[1].scale = FE_SCALE_RELATIVE;
++	c->strength.stat[1].uvalue = (100 + val/10) * 656;
++
++	val = 0;
++	c->cnr.len = 1;
++	c->cnr.stat[0].scale = FE_SCALE_NOT_AVAILABLE;
++
++	/* Read snr */
++	ret = tas2101_rdm(priv, SNR_0, buf, 2);
++	if (ret)
++		return ret;
++
++	raw = (((u16)buf[1] & 0x0f) << 8) | buf[0];
++
++	for (i = 0; i < ARRAY_SIZE(tas2101_snrtable) - 1; i++)
++		if (tas2101_snrtable[i].raw < raw)
++			break;
++
++	if( i == 0 )
++		val = tas2101_snrtable[i].snr;
++	else
++	{
++		/* linear interpolation between two calibrated values */
++		val = (raw - tas2101_snrtable[i].raw) * tas2101_snrtable[i-1].snr;
++		val += (tas2101_snrtable[i-1].raw - raw) * tas2101_snrtable[i].snr;
++		val /= (tas2101_snrtable[i-1].raw - tas2101_snrtable[i].raw);
++	}
++
++	c->cnr.len = 2;
++	c->cnr.stat[0].scale = FE_SCALE_DECIBEL;
++	c->cnr.stat[0].uvalue = 100 * (s64) val;
++
++	c->cnr.stat[1].scale = FE_SCALE_RELATIVE;
++	c->cnr.stat[1].uvalue = (u16) val * 328;
++	if (c->cnr.stat[1].uvalue > 0xffff)
++		c->cnr.stat[1].uvalue = 0xffff;
++
++	return ret;
++}
++
++static int tas2101_read_signal_strength(struct dvb_frontend *fe,
++	u16 *strength)
++{
++	struct dtv_frontend_properties *p = &fe->dtv_property_cache;
++	int i;
++
++	*strength = 0;
++	for (i=0; i < p->strength.len; i++)
++	{
++		if (p->strength.stat[i].scale == FE_SCALE_RELATIVE)
++			*strength = (u16)p->strength.stat[i].uvalue;
++		else if (p->strength.stat[i].scale == FE_SCALE_DECIBEL)
++			*strength = ((100000 + (s32)p->strength.stat[i].svalue)/1000) * 656;
++	}
++
++	return 0;
++}
++
++
++static int tas2101_read_snr(struct dvb_frontend *fe, u16 *snr)
++{
++	struct dtv_frontend_properties *p = &fe->dtv_property_cache;
++	int i;
++
++	*snr = 0;
++	for (i=0; i < p->cnr.len; i++)
++		if (p->cnr.stat[i].scale == FE_SCALE_RELATIVE)
++		  *snr = (u16)p->cnr.stat[i].uvalue;
++
++	return 0;
++}
++
++static int tas2101_read_ber(struct dvb_frontend *fe, u32 *ber)
++{
++	struct tas2101_priv *priv = fe->demodulator_priv;
++	struct dtv_frontend_properties *c = &fe->dtv_property_cache;
++	int ret;
++	u8 buf[4];
++
++	dev_dbg(&priv->i2c->dev, "%s()\n", __func__);
++
++	switch (c->delivery_system) {
++		case SYS_DVBS:
++			ret = tas2101_rdm(priv, S1_BER_0, buf, 4);
++			if (ret)
++				return ret;
++
++			*ber = ((((u32) buf[3] & 3) << 24) | (((u32) buf[2]) << 16)
++				| (((u32) buf[1]) << 8) | ((u32) buf[0]));
++			break;
++
++		case SYS_DVBS2:
++			ret = tas2101_rdm(priv, S2_BER_0, buf, 2);
++			if (ret)
++				return ret;
++
++			*ber = ((((u32) buf[1]) << 8) | ((u32) buf[0]));
++			break;
++
++		default:
++			*ber = 0;
++			break;
++	}
++
++	dev_dbg(&priv->i2c->dev, "%s() ber = %d\n", __func__, *ber);
++	return 0;
++}
++
++/* unimplemented */
++static int tas2101_read_ucblocks(struct dvb_frontend *fe, u32 *ucblocks)
++{
++	struct tas2101_priv *priv = fe->demodulator_priv;
++	dev_dbg(&priv->i2c->dev, "%s()\n", __func__);
++	*ucblocks = 0;
++	return 0;
++}
++
++static void tas2101_spi_read(struct dvb_frontend *fe, struct ecp3_info *ecp3inf)
++{
++
++	struct tas2101_priv *priv = fe->demodulator_priv;
++	struct i2c_adapter *adapter = priv->i2c;
++	if (priv->cfg->read_properties)
++		priv->cfg->read_properties(adapter,ecp3inf->reg, &(ecp3inf->data));
++	return;
++}
++static void tas2101_spi_write(struct dvb_frontend *fe,struct ecp3_info *ecp3inf)
++{
++	struct tas2101_priv *priv = fe->demodulator_priv;
++	struct i2c_adapter *adapter = priv->i2c;
++	if (priv->cfg->write_properties)
++		priv->cfg->write_properties(adapter,ecp3inf->reg, ecp3inf->data);
++	return ;
++}
++
++static void tas2101_eeprom_read(struct dvb_frontend *fe, struct eeprom_info *eepinf)
++{
++	struct tas2101_priv *priv = fe->demodulator_priv;
++	struct i2c_adapter *adapter = priv->i2c;
++
++	if (priv->cfg->read_eeprom)
++		priv->cfg->read_eeprom(adapter,eepinf->reg, &(eepinf->data));
++	return ;
++}
++
++static void tas2101_eeprom_write(struct dvb_frontend *fe,struct eeprom_info *eepinf)
++{
++	struct tas2101_priv *priv = fe->demodulator_priv;
++	struct i2c_adapter *adapter = priv->i2c;
++
++	if (priv->cfg->write_eeprom)
++		priv->cfg->write_eeprom(adapter,eepinf->reg, eepinf->data);
++	return ;
++}
++
++static int tas2101_set_voltage(struct dvb_frontend *fe,
++	enum fe_sec_voltage voltage)
++{
++	struct tas2101_priv *priv = fe->demodulator_priv;
++	int ret = 0;
++	
++	dev_dbg(&priv->i2c->dev, "%s() %s\n", __func__,
++		voltage == SEC_VOLTAGE_13 ? "SEC_VOLTAGE_13" :
++		voltage == SEC_VOLTAGE_18 ? "SEC_VOLTAGE_18" :
++		"SEC_VOLTAGE_OFF");
++
++	switch (voltage) {
++		case SEC_VOLTAGE_13:
++			if (priv->cfg->lnb_power)
++				priv->cfg->lnb_power(fe, LNB_ON);
++			ret = tas2101_regmask(priv, LNB_CTRL,
++				0, VSEL13_18);
++			break;
++		case SEC_VOLTAGE_18:
++			if (priv->cfg->lnb_power)
++				priv->cfg->lnb_power(fe, LNB_ON);
++			ret = tas2101_regmask(priv, LNB_CTRL,
++				VSEL13_18, 0);
++			break;
++		default: /* OFF */
++			if (priv->cfg->lnb_power)
++				priv->cfg->lnb_power(fe, LNB_OFF);
++			break;
++	}
++	return ret;
++}
++
++static int tas2101_set_tone(struct dvb_frontend *fe,
++	enum fe_sec_tone_mode tone)
++{
++	struct tas2101_priv *priv = fe->demodulator_priv;
++	int ret = -EINVAL;
++
++	dev_dbg(&priv->i2c->dev, "%s() %s\n", __func__,
++		tone == SEC_TONE_ON ? "SEC_TONE_ON" : "SEC_TONE_OFF");
++
++	switch (tone) {
++	case SEC_TONE_ON:
++		ret = tas2101_regmask(priv, LNB_CTRL,
++			TONE_ON, DISEQC_CMD_MASK);
++		break;
++	case SEC_TONE_OFF:
++		ret = tas2101_regmask(priv, LNB_CTRL,
++			TONE_OFF, DISEQC_CMD_MASK);
++		break;
++	default:
++		dev_warn(&priv->i2c->dev, "%s() invalid tone (%d)\n",
++			__func__, tone);
++		break;
++	}
++	return ret;
++}
++
++static int tas2101_send_diseqc_msg(struct dvb_frontend *fe,
++	struct dvb_diseqc_master_cmd *d)
++{
++	struct tas2101_priv *priv = fe->demodulator_priv;
++	int ret, i;
++	u8 bck, buf[9];
++
++	/* dump DiSEqC message */
++	dev_dbg(&priv->i2c->dev, "%s() ( ", __func__);
++	for (i = 0; i < d->msg_len; i++)
++		dev_dbg(&priv->i2c->dev, "0x%02x ", d->msg[i]);
++	dev_dbg(&priv->i2c->dev, ")\n");
++
++	/* backup LNB tone state */
++	ret = tas2101_rd(priv, LNB_CTRL, &bck);
++	if (ret)
++		return ret;
++
++	ret = tas2101_regmask(priv, REG_34, 0, 0x40);
++	if (ret)
++		goto exit;
++
++	/* setup DISEqC message to demod */
++	buf[0] = DISEQC_BUFFER;
++	memcpy(&buf[1], d->msg, 8);
++	ret = tas2101_wrm(priv, buf, d->msg_len + 1);
++	if (ret)
++		goto exit;
++
++	/* send DISEqC send command */
++	buf[0] = (bck & ~(DISEQC_CMD_LEN_MASK | DISEQC_CMD_MASK)) |
++		DISEQC_SEND_MSG | ((d->msg_len - 1) << 3);
++	ret = tas2101_wr(priv, LNB_CTRL, buf[0]);
++	if (ret)
++		goto exit;
++
++	/* wait at least diseqc typical tx time */
++	msleep(54);
++
++	/* Wait for busy flag to clear */
++	for (i = 0; i < 10; i++) {
++		ret = tas2101_rd(priv, LNB_STATUS, &buf[0]);
++		if (ret)
++			break;
++		if (buf[0] & DISEQC_BUSY)
++			goto exit;
++		msleep(20);
++	}
++
++	/* try to restore the tone setting but return a timeout error */
++	ret = tas2101_wr(priv, LNB_CTRL, bck);
++	dev_warn(&priv->i2c->dev, "%s() timeout sending burst\n", __func__);
++	return -ETIMEDOUT;
++exit:
++	/* restore tone setting */
++	return tas2101_wr(priv, LNB_CTRL, bck);
++}
++
++static int tas2101_diseqc_send_burst(struct dvb_frontend *fe,
++	enum fe_sec_mini_cmd burst)
++{
++	struct tas2101_priv *priv = fe->demodulator_priv;
++	int ret, i;
++	u8 bck, r;
++
++	if ((burst != SEC_MINI_A) && (burst != SEC_MINI_B)) {
++		dev_err(&priv->i2c->dev, "%s() invalid burst(%d)\n",
++			__func__, burst);
++		return -EINVAL;
++	}
++
++	dev_dbg(&priv->i2c->dev, "%s() %s\n", __func__,
++		burst == SEC_MINI_A ? "SEC_MINI_A" : "SEC_MINI_B");
++
++	/* backup LNB tone state */
++	ret = tas2101_rd(priv, LNB_CTRL, &bck);
++	if (ret)
++		return ret;
++
++	ret = tas2101_regmask(priv, REG_34, 0, 0x40);
++	if (ret)
++		goto exit;
++
++	/* set tone burst cmd */
++	r = (bck & ~DISEQC_CMD_MASK) |
++		(burst == SEC_MINI_A) ? DISEQC_BURST_A : DISEQC_BURST_B;
++
++	ret = tas2101_wr(priv, LNB_CTRL, r);
++	if (ret)
++		goto exit;
++
++	/* spec = around 12.5 ms for the burst */
++	for (i = 0; i < 10; i++) {
++		ret = tas2101_rd(priv, LNB_STATUS, &r);
++		if (ret)
++			break;
++		if (r & DISEQC_BUSY)
++			goto exit;
++		msleep(20);
++	}
++
++	/* try to restore the tone setting but return a timeout error */
++	ret = tas2101_wr(priv, LNB_CTRL, bck);
++	dev_warn(&priv->i2c->dev, "%s() timeout sending burst\n", __func__);
++	return -ETIMEDOUT;
++exit:
++	/* restore tone setting */
++	return tas2101_wr(priv, LNB_CTRL, bck);
++}
++
++static void tas2101_release(struct dvb_frontend *fe)
++{
++	struct tas2101_priv *priv = fe->demodulator_priv;
++
++	dev_dbg(&priv->i2c->dev, "%s\n", __func__);
++#ifdef TAS2101_USE_I2C_MUX
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 7, 0)
++	i2c_mux_del_adapters(priv->muxc);
++#else
++	i2c_del_mux_adapter(priv->i2c_demod);
++	i2c_del_mux_adapter(priv->i2c_tuner);
++#endif
++#endif
++	kfree(priv);
++}
++
++#ifdef TAS2101_USE_I2C_MUX
++/* channel 0: demod */
++/* channel 1: tuner */
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 7, 0)
++static int tas2101_i2c_select(struct i2c_mux_core *muxc, u32 chan_id)
++{
++	struct tas2101_priv *priv = i2c_mux_priv(muxc);
++	struct i2c_adapter *adap = priv->i2c;
++#else
++static int tas2101_i2c_select(struct i2c_adapter *adap,
++	void *mux_priv, u32 chan_id)
++{
++	struct tas2101_priv *priv = mux_priv;
++#endif
++	int ret;
++	u8 buf[2];
++	struct i2c_msg msg_wr[] = {
++		{ .addr = priv->cfg->i2c_address, .flags = 0,
++			.buf = buf, .len = 2 }
++	};
++	struct i2c_msg msg_rd[] = {
++		{ .addr = priv->cfg->i2c_address, .flags = 0,
++			.buf = &buf[0], .len = 1 },
++		{ .addr = priv->cfg->i2c_address, .flags = I2C_M_RD,
++			.buf = &buf[1], .len = 1 }
++	};
++
++	dev_dbg(&priv->i2c->dev, "%s() ch=%d\n", __func__, chan_id);
++
++	if (priv->i2c_ch == chan_id)
++		return 0;
++
++	buf[0] = REG_06;
++	ret = __i2c_transfer(adap, msg_rd, 2);
++	if (ret != 2)
++		goto err;
++
++	if (chan_id == 0)
++		buf[1] &= ~I2C_GATE;
++	else
++		buf[1] |= I2C_GATE;
++
++	ret = __i2c_transfer(adap, msg_wr, 1);
++	if (ret != 1)
++		goto err;
++
++	priv->i2c_ch = chan_id;
++
++	return 0;
++err:
++	dev_dbg(&priv->i2c->dev, "%s() failed=%d\n", __func__, ret);
++	return -EREMOTEIO;
++}
++#endif
++
++static struct dvb_frontend_ops tas2101_ops;
++
++struct dvb_frontend *tas2101_attach(const struct tas2101_config *cfg,
++	struct i2c_adapter *i2c)
++{
++	struct tas2101_priv *priv = NULL;
++	int ret;
++	u8 id[2];
++
++	dev_dbg(&i2c->dev, "%s: Attaching frontend\n", KBUILD_MODNAME);
++
++	/* allocate memory for the priv data */
++	priv = kzalloc(sizeof(struct tas2101_priv), GFP_KERNEL);
++	if (priv == NULL)
++		goto err;
++
++	priv->cfg = cfg;
++	priv->i2c = i2c;
++	priv->i2c_ch = 0;
++
++#ifdef TAS2101_USE_I2C_MUX
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 7, 0)
++	/* create mux i2c adapter for tuner */
++	priv->muxc = i2c_mux_alloc(i2c, &i2c->dev,
++				  2, 0, I2C_MUX_LOCKED,
++				  tas2101_i2c_select, NULL);
++	if (!priv->muxc) {
++		ret = -ENOMEM;
++		goto err1;
++	}
++	priv->muxc->priv = priv;
++	ret = i2c_mux_add_adapter(priv->muxc, 0, 0);
++	if (ret)
++		goto err1;
++	ret = i2c_mux_add_adapter(priv->muxc, 0, 1);
++	if (ret)
++		goto err1;
++	priv->i2c_demod = priv->muxc->adapter[0];
++	priv->i2c_tuner = priv->muxc->adapter[1];
++#else
++	/* create muxed i2c adapter for the demod */
++	priv->i2c_demod = i2c_add_mux_adapter(i2c, &i2c->dev, priv, 0, 0, 0,
++		tas2101_i2c_select, NULL);
++	if (priv->i2c_demod == NULL)
++		goto err1;
++
++	/* create muxed i2c adapter for the tuner */
++	priv->i2c_tuner = i2c_add_mux_adapter(i2c, &i2c->dev, priv, 0, 1, 0,
++		tas2101_i2c_select, NULL);
++	if (priv->i2c_tuner == NULL)
++		goto err2;
++#endif
++#else
++	priv->i2c_demod = i2c;
++	priv->i2c_tuner = i2c;
++#endif
++
++	/* create dvb_frontend */
++	memcpy(&priv->fe.ops, &tas2101_ops,
++		sizeof(struct dvb_frontend_ops));
++	priv->fe.demodulator_priv = priv;
++
++	/* reset demod */
++	if (cfg->reset_demod)
++		cfg->reset_demod(&priv->fe);
++
++	msleep(100);
++
++	/* check if demod is alive */
++	ret = tas2101_rdm(priv, ID_0, id, 2);
++	if ((id[0] != 0x44) || (id[1] != 0x4c))
++		ret |= -EIO;
++	if (ret)
++		goto err3;
++
++	return &priv->fe;
++
++err3:
++#ifdef TAS2101_USE_I2C_MUX
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 7, 0)
++	i2c_mux_del_adapters(priv->muxc);
++#else
++	i2c_del_mux_adapter(priv->i2c_tuner);
++err2:
++	i2c_del_mux_adapter(priv->i2c_demod);
++#endif
++#endif
++err1:
++	kfree(priv);
++err:
++	dev_err(&i2c->dev, "%s: Error attaching frontend\n", KBUILD_MODNAME);
++	return NULL;
++}
++EXPORT_SYMBOL_GPL(tas2101_attach);
++
++static int tas2101_initfe(struct dvb_frontend *fe)
++{
++	struct tas2101_priv *priv = fe->demodulator_priv;
++	struct tas2101_regtable *t;
++	u8 buf[7], size;
++	int ret;
++
++	dev_dbg(&priv->i2c->dev, "%s()\n", __func__);
++
++	if (priv->cfg->id == ID_TAS2101) {
++		t = tas2101_initfe0;
++		size = ARRAY_SIZE(tas2101_initfe0);
++	} else {
++		t = tas2100_initfe0;
++		size = ARRAY_SIZE(tas2100_initfe0);
++	}
++	ret = tas2101_wrtable(priv, t, size);
++	if (ret)
++		return ret;
++
++	buf[0] = 0xe6;
++	memcpy(&buf[1], priv->cfg->init, 6);
++	ret = tas2101_wrm(priv, buf, 7);
++	if (ret)
++		return ret;
++
++	ret = tas2101_regmask(priv, 0xe0, priv->cfg->init[6], 0xff);
++	if (ret)
++		return ret;
++
++	if (priv->cfg->id == ID_TAS2101) {
++		t = tas2101_initfe1;
++		size = ARRAY_SIZE(tas2101_initfe1);
++	} else {
++		t = tas2100_initfe1;
++		size = ARRAY_SIZE(tas2100_initfe1);
++	}
++	ret = tas2101_wrtable(priv, t, size);
++	if (ret)
++		return ret;
++
++	if (priv->cfg->init2) {
++		t = tas2101_initfe2;
++		size = ARRAY_SIZE(tas2101_initfe2);
++		ret = tas2101_wrtable(priv, t, size);
++		if (ret)
++			return ret;
++	}
++
++	return 0;
++}
++
++static int tas2101_sleep(struct dvb_frontend *fe)
++{
++	struct tas2101_priv *priv = fe->demodulator_priv;
++	dev_dbg(&priv->i2c->dev, "%s()\n", __func__);
++	return 0;
++}
++
++static int tas2101_set_frontend(struct dvb_frontend *fe)
++{
++	struct tas2101_priv *priv = fe->demodulator_priv;
++	struct dtv_frontend_properties *c = &fe->dtv_property_cache;
++	enum fe_status tunerstat;
++	int ret, i;
++	u32 s;
++	u8 buf[3];
++
++	dev_dbg(&priv->i2c->dev, "%s()\n", __func__);
++
++	/* do some basic parameter validation */
++	switch (c->delivery_system) {
++	case SYS_DVBS:
++		dev_dbg(&priv->i2c->dev, "%s() DVB-S\n", __func__);
++		/* Only QPSK is supported for DVB-S */
++		if (c->modulation != QPSK) {
++			dev_dbg(&priv->i2c->dev,
++				"%s() unsupported modulation (%d)\n",
++				__func__, c->modulation);
++			return -EINVAL;
++		}
++		break;
++	case SYS_DVBS2:
++		dev_dbg(&priv->i2c->dev, "%s() DVB-S2\n", __func__);
++		break;
++	default:
++		dev_warn(&priv->i2c->dev,
++			"%s() unsupported delivery system (%d)\n",
++			__func__, c->delivery_system);
++		return -EINVAL;
++	}
++
++	ret = tas2101_wrtable(priv, tas2101_setfe, ARRAY_SIZE(tas2101_setfe));
++	if (ret)
++		return ret;
++
++	/* set symbol rate */
++	s = c->symbol_rate / 1000;
++	buf[0] = SET_SRATE0;
++	buf[1] = (u8) s;
++	buf[2] = (u8) (s >> 8);
++	ret = tas2101_wrm(priv, buf, 3);
++	if (ret)
++		return ret;
++
++	/* clear freq offset */
++	buf[0] = FREQ_OS0;
++	buf[1] = 0;
++	buf[2] = 0;
++	ret = tas2101_wrm(priv, buf, 3);
++	if (ret)
++		return ret;
++
++	if (fe->ops.tuner_ops.set_params) {
++#ifndef TAS2101_USE_I2C_MUX
++		if (fe->ops.i2c_gate_ctrl)
++			fe->ops.i2c_gate_ctrl(fe, 1);
++#endif
++		fe->ops.tuner_ops.set_params(fe);
++#ifndef TAS2101_USE_I2C_MUX
++		if (fe->ops.i2c_gate_ctrl)
++			fe->ops.i2c_gate_ctrl(fe, 0);
++#endif
++	}
++
++	ret = tas2101_regmask(priv, REG_30, 0x01, 0);
++	if (ret)
++		return ret;
++
++	for (i = 0; i<15; i++) {
++		ret = tas2101_read_status(fe, &tunerstat);
++		if (tunerstat & FE_HAS_LOCK)
++			return 0;
++		msleep(20);
++	}
++	return -EINVAL;
++}
++
++static int tas2101_get_frontend(struct dvb_frontend *fe,
++				struct dtv_frontend_properties *c)
++{
++	struct tas2101_priv *priv = fe->demodulator_priv;
++	int ret;
++	u8 reg, buf[2];
++
++	dev_dbg(&priv->i2c->dev, "%s()\n", __func__);
++
++	ret = tas2101_rd(priv, MODFEC_0, &reg);
++	if (ret)
++		return ret;
++
++	if ((reg >> 6) == 0) {
++		/* DVB-S */
++		reg &= 0x07;
++	} else {
++		/* DVB-S2 */
++		ret = tas2101_rd(priv, MODFEC_1, &reg);
++		if (ret)
++			return ret;
++		reg += 5;
++	}
++
++	if (reg > 33) {
++		dev_dbg(&priv->i2c->dev, "%s() Unable to get current delivery"
++			" system and mode.\n", __func__);
++		reg = 0;
++	}
++
++	c->fec_inner = tas2101_modfec_modes[reg].fec;
++	c->modulation = tas2101_modfec_modes[reg].modulation;
++	c->delivery_system = tas2101_modfec_modes[reg].delivery_system;
++	c->inversion = INVERSION_AUTO;
++
++	/* symbol rate */
++	ret = tas2101_rdm(priv, GET_SRATE0, buf, 2);
++	if (ret)
++		return ret;
++	c->symbol_rate = ((buf[1] << 8) | buf[0]) * 1000;
++
++	return 0;
++}
++
++static int tas2101_tune(struct dvb_frontend *fe, bool re_tune,
++	unsigned int mode_flags, unsigned int *delay, enum fe_status *status)
++{
++	struct tas2101_priv *priv = fe->demodulator_priv;
++
++	dev_dbg(&priv->i2c->dev, "%s()\n", __func__);
++
++	*delay = HZ / 5;
++	if (re_tune) {
++		int ret = tas2101_set_frontend(fe);
++		if (ret)
++			return ret;
++	}
++	return tas2101_read_status(fe, status);
++}
++
++static enum dvbfe_algo tas2101_get_algo(struct dvb_frontend *fe)
++{
++	return DVBFE_ALGO_HW;
++}
++
++#ifndef TAS2101_USE_I2C_MUX
++static int tas2101_i2c_gate_ctrl(struct dvb_frontend* fe, int enable)
++{
++	struct tas2101_priv *priv = fe->demodulator_priv;
++	int ret;
++
++	if (enable)
++		ret = tas2101_regmask(priv, REG_06, I2C_GATE, 0);
++	else
++		ret = tas2101_regmask(priv, REG_06, 0, I2C_GATE);
++
++	return ret;
++}
++#endif
++
++static struct dvb_frontend_ops tas2101_ops = {
++	.delsys = { SYS_DVBS, SYS_DVBS2 },
++	.info = {
++		.name = "Tmax TAS2101",
++		.frequency_min_hz = 950 * MHz,
++		.frequency_max_hz = 2150 * MHz,
++		.symbol_rate_min = 1000000,
++		.symbol_rate_max = 45000000,
++		.caps = FE_CAN_INVERSION_AUTO |
++			FE_CAN_FEC_1_2 | FE_CAN_FEC_2_3 | FE_CAN_FEC_3_4 |
++			FE_CAN_FEC_4_5 | FE_CAN_FEC_5_6 | FE_CAN_FEC_6_7 |
++			FE_CAN_FEC_7_8 | FE_CAN_FEC_AUTO |
++			FE_CAN_2G_MODULATION |
++			FE_CAN_QPSK | FE_CAN_RECOVER
++	},
++	.release = tas2101_release,
++
++	.init = tas2101_initfe,
++	.sleep = tas2101_sleep,
++#ifndef TAS2101_USE_I2C_MUX
++	.i2c_gate_ctrl = tas2101_i2c_gate_ctrl,
++#endif
++	.read_status = tas2101_read_status,
++	.read_ber = tas2101_read_ber,
++	.read_signal_strength = tas2101_read_signal_strength,
++	.read_snr = tas2101_read_snr,
++	.read_ucblocks = tas2101_read_ucblocks,
++
++	.set_tone = tas2101_set_tone,
++	.set_voltage = tas2101_set_voltage,
++	.diseqc_send_master_cmd = tas2101_send_diseqc_msg,
++	.diseqc_send_burst = tas2101_diseqc_send_burst,
++	.get_frontend_algo = tas2101_get_algo,
++	.tune = tas2101_tune,
++
++	.set_frontend = tas2101_set_frontend,
++	.get_frontend = tas2101_get_frontend,
++
++	.spi_read			= tas2101_spi_read,
++	.spi_write			= tas2101_spi_write,
++	.eeprom_read		= tas2101_eeprom_read,
++	.eeprom_write		= tas2101_eeprom_write,
++};
++
++MODULE_DESCRIPTION("DVB Frontend module for Tmax TAS2101");
++MODULE_AUTHOR("Luis Alves (ljalvs@gmail.com)");
++MODULE_LICENSE("GPL");
++MODULE_VERSION("1.0");
++
+diff -urN linux.orig/drivers/media/dvb-frontends/tas2101.h linux/drivers/media/dvb-frontends/tas2101.h
+--- linux.orig/drivers/media/dvb-frontends/tas2101.h	1970-01-01 01:00:00.000000000 +0100
++++ linux/drivers/media/dvb-frontends/tas2101.h	2024-08-04 19:57:02.313598180 +0100
+@@ -0,0 +1,80 @@
++/*
++    Tmax TAS2101 - DVBS/S2 Satellite demod/tuner driver
++
++    Copyright (C) 2014 Luis Alves <ljalvs@gmail.com>
++
++    This program is free software; you can redistribute it and/or modify
++    it under the terms of the GNU General Public License as published by
++    the Free Software Foundation; either version 2 of the License, or
++    (at your option) any later version.
++
++    This program is distributed in the hope that it will be useful,
++    but WITHOUT ANY WARRANTY; without even the implied warranty of
++    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++    GNU General Public License for more details.
++
++    You should have received a copy of the GNU General Public License
++    along with this program; if not, write to the Free Software
++    Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
++*/
++
++#ifndef TAS2101_H
++#define TAS2101_H
++
++#include <linux/kconfig.h>
++#include <linux/dvb/frontend.h>
++
++typedef enum tas210x_id {
++	ID_TAS2100,
++	ID_TAS2101,
++} tas210x_id_t;
++
++struct tas2101_config {
++	/* demodulator i2c address */
++	u8 i2c_address;
++
++	/* chip id */
++	tas210x_id_t id;
++
++	/* demod hard reset */
++	void (*reset_demod)(struct dvb_frontend *fe);
++	/* lnb power */
++	void (*lnb_power)(struct dvb_frontend *fe, int onoff);
++
++	//spi flash op
++	void (*write_properties) (struct i2c_adapter *i2c,u8 reg, u32 buf);  
++	void (*read_properties) (struct i2c_adapter *i2c,u8 reg, u32 *buf);
++	void (*write_eeprom) (struct i2c_adapter *i2c,u8 reg, u8 buf);
++	void (*read_eeprom) (struct i2c_adapter *i2c,u8 reg, u8 *buf);
++
++	void (*mcuWrite_properties) (struct i2c_adapter *i2c,u32 bassaddr,u8 reg, u32 buf);  
++	void (*mcuRead_properties) (struct i2c_adapter *i2c,u32 bassaddr,u8 reg, u32 *buf);	
++	void (*i2cRead_properties) (struct i2c_adapter *i2c,u8 chip_addr,u8 reg, u8 num, u8 *buf);
++	void (*i2cwrite_properties) (struct i2c_adapter *i2c,u8 chip_addr,u8 reg, u8 num, u8 *buf);
++	/* frontend gpio/tuner init */
++	u8 init[7];
++	u8 init2;
++};
++
++
++
++#if IS_REACHABLE(CONFIG_DVB_TAS2101)
++extern struct dvb_frontend *tas2101_attach(
++	const struct tas2101_config *cfg,
++	struct i2c_adapter *i2c);
++extern struct i2c_adapter *tas2101_get_i2c_adapter(struct dvb_frontend *fe, int bus);
++#else
++static inline struct dvb_frontend *tas2101_attach(
++	const struct tas2101_config *cfg,
++	struct i2c_adapter *i2c)
++{
++	dev_warn(&i2c->dev, "%s: driver disabled by Kconfig\n", __func__);
++	return NULL;
++}
++static struct i2c_adapter *tas2101_get_i2c_adapter(struct dvb_frontend *fe, int bus)
++{
++	return NULL;
++}
++#endif
++
++#endif /* TAS2101_H */
+diff -urN linux.orig/drivers/media/dvb-frontends/tas2101_priv.h linux/drivers/media/dvb-frontends/tas2101_priv.h
+--- linux.orig/drivers/media/dvb-frontends/tas2101_priv.h	1970-01-01 01:00:00.000000000 +0100
++++ linux/drivers/media/dvb-frontends/tas2101_priv.h	2024-08-04 19:57:10.109654001 +0100
+@@ -0,0 +1,328 @@
++/*
++    Tmas TAS2101 - DVBS/S2 Satellite demod/tuner driver
++
++    Copyright (C) 2014 Luis Alves <ljalvs@gmail.com>
++
++    This program is free software; you can redistribute it and/or modify
++    it under the terms of the GNU General Public License as published by
++    the Free Software Foundation; either version 2 of the License, or
++    (at your option) any later version.
++
++    This program is distributed in the hope that it will be useful,
++    but WITHOUT ANY WARRANTY; without even the implied warranty of
++    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++    GNU General Public License for more details.
++
++    You should have received a copy of the GNU General Public License
++    along with this program; if not, write to the Free Software
++    Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
++*/
++
++#ifndef TAS2101_PRIV_H
++#define TAS2101_PRIV_H
++
++struct tas2101_priv {
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 7, 0)
++	struct i2c_mux_core *muxc;
++#endif
++	struct list_head     stvlist;
++	int                  count;
++	/* master i2c adapter */
++	struct i2c_adapter *i2c;
++	/* muxed i2c adapter for the demod */
++	struct i2c_adapter *i2c_demod;
++	/* muxed i2c adapter for the tuner */
++	struct i2c_adapter *i2c_tuner;
++
++	int i2c_ch;
++
++	struct dvb_frontend fe;
++	const struct tas2101_config *cfg;
++
++};
++
++/* demod registers */
++enum tas2101_reg_addr {
++	ID_0		= 0x00,
++	ID_1		= 0x01,
++	REG_04		= 0x04,
++	REG_06		= 0x06,
++	LNB_CTRL	= 0x10,
++	LNB_STATUS	= 0x16,
++	DISEQC_BUFFER	= 0x20,
++	REG_30		= 0x30,
++	DEMOD_STATUS	= 0x31,
++	REG_34		= 0x34,
++	SIGSTR_0	= 0x42,
++	SIGSTR_1	= 0x43,
++	GET_SRATE0	= 0x5c,
++	GET_SRATE1	= 0x5d,
++	SET_SRATE0	= 0x73,
++	SET_SRATE1	= 0x74,
++	FREQ_OS0	= 0x75,
++	FREQ_OS1	= 0x76,
++	SNR_0		= 0x92,
++	SNR_1		= 0x93,
++	S1_BER_0	= 0xd1,
++	S1_BER_1	= 0xd2,
++	S1_BER_2	= 0xd3,
++	S1_BER_3	= 0xd4,
++	S2_BER_0	= 0xec,
++	S2_BER_1	= 0xed,
++	MODFEC_0	= 0xee,
++	MODFEC_1	= 0xef,
++};
++
++#define I2C_GATE		0x80
++
++#define VSEL13_18		0x40
++#define DISEQC_CMD_LEN_MASK	0x38
++#define DISEQC_CMD_MASK		0x07
++
++
++
++enum tas2101_diseqc_cmd {
++	TONE_OFF	= 0x00,
++	TONE_ON		= 0x01,
++	DISEQC_BURST_A	= 0x02,
++	DISEQC_BURST_B	= 0x03,
++	DISEQC_SEND_MSG	= 0x04,
++};
++
++#define DISEQC_BUSY		0x10
++
++#define DEMOD_STATUS_MASK	0x75
++#define DEMOD_LOCKED		0x75
++
++
++enum tas2101_lnb_power {
++	LNB_OFF = 0,
++	LNB_ON  = 1,
++};
++
++struct tas2101_regtable {
++	u8 addr;
++	u8 setmask;
++	u8 clrmask;
++	int sleep;
++};
++
++static struct tas2101_regtable tas2101_initfe0[] = {
++	{REG_30, 0x02, 0x00, 0},
++	{0x56, 0x00, 0x02, 0},
++	{0x05, 0x04, 0x00, 0},
++	{0x05, 0x00, 0x04, 60},
++	{0x08, 0x80, 0x00, 0},
++	{0x09, 0x3b, 0xff, 0},
++	{0x08, 0x00, 0x80, 60},
++	{0x0a, 0x80, 0x00, 0},
++	{0x0b, 0x47, 0xff, 0},
++	{0x0a, 0x00, 0x80, 40},
++	{0x03, 0xa9, 0xff, 40},
++	{0x0e, 0x05, 0xff, 0},
++	{0x0f, 0x06, 0xff, 40},
++	{0x70, 0x82, 0xff, 0},
++	{0x71, 0x8b, 0xff, 0},
++	{0x72, 0x01, 0xff, 0},
++	{0x0d, 0x00, 0xc0, 40},
++	{0x0d, 0xc0, 0x00, 0},
++};
++
++static struct tas2101_regtable tas2100_initfe0[] = {
++	{REG_30, 0x02, 0x00, 0},
++	{0x08, 0x00, 0x80, 60},
++	{0x0b, 0x55, 0xff, 0},
++	{0x0a, 0x00, 0x80, 40},
++	{0x0e, 0x04, 0xff, 0},
++	{0x0f, 0x05, 0xff, 40},
++	{0x70, 0x98, 0xff, 0},
++	{0x71, 0x66, 0xff, 0},
++	{0x72, 0x01, 0xff, 0},
++	{0x0d, 0x00, 0xc0, 40},
++	{0x0d, 0xc0, 0x00, 0},
++};
++
++static struct tas2101_regtable tas2101_initfe1[] = {
++/*	{0xe0, 0x33, 0xff, 0},	depends on tsmode ( 0xb1 tsmode=1 ) */
++	{0x56, 0x81, 0x00, 0},
++	{0x05, 0x00, 0x08, 0},
++	{0x36, 0x00, 0x40, 0},
++	{0x91, 0x00, 0xf0, 0},
++	{0x35, 0x75, 0xff, 0},
++	{REG_04, 0x00, 0x80, 0},
++	{0x0d, 0x80, 0x00, 0},
++	{0x30, 0x01, 0x00, 0},
++	{0x05, 0x00, 0x80, 0},
++	{REG_06, 0, I2C_GATE, 0},
++	{0x41, 0x1c, 0x3f, 0},
++	{0x46, 0xdc, 0xff, 0},
++	{0x11, 0x7f, 0xff, 0},
++	{0x12, 0x04, 0x07, 0},
++	{0x1f, 0x00, 0x01, 0},
++	{REG_34, 0x00, 0x40, 0},
++	{0xd0, 0x05, 0x7f, 0},
++	{0xe3, 0x02, 0x03, 0},
++	{0x58, 0x60, 0xe0, 0},
++	{0x50, 0x64, 0xff, 0},
++	{0x9e, 0x08, 0x3f, 0},
++	{0x9d, 0x07, 0x00, 0},
++	{0x49, 0xa0, 0xf0, 0},
++	{0x87, 0x70, 0xf0, 0},
++	{0x90, 0x04, 0xff, 0},
++	{0x9d, 0x07, 0x00, 0},
++	{0x9e, 0x20, 0x3f, 0},
++	{REG_06, 0x00, 0x1f, 0},
++	{0x46, 0x18, 0x1f, 0},
++	{0x40, 0x04, 0x07, 0},
++};
++
++
++static struct tas2101_regtable tas2101_initfe2[] = {
++	{0xfa, 0x01, 0x03, 0},
++	{0xfb, 0x02, 0xff, 0},
++};
++
++static struct tas2101_regtable tas2100_initfe1[] = {
++	{0x56, 0x81, 0x00, 0},
++	{0x05, 0x00, 0x08, 0},
++	{0x36, 0x00, 0x40, 0},
++	{0x91, 0x22, 0xff, 0},
++	{0x35, 0x75, 0xff, 0},
++	{REG_04, 0x30, 0xff, 0},
++	{0x30, 0x01, 0x00, 0},
++	{0x05, 0x00, 0x80, 0},
++	{REG_06, 0, I2C_GATE, 0},
++	{0x41, 0x1c, 0x3f, 0},
++	{0x46, 0xdc, 0xff, 0},
++	{0x11, 0x13, 0xff, 0},
++	{0x12, 0x04, 0x07, 0},
++	{REG_34, 0x00, 0x40, 0},
++	{0xd0, 0x05, 0x7f, 0},
++	{0xe3, 0x02, 0x03, 0},
++	{0x58, 0x60, 0xe0, 0},
++	{0x50, 0x64, 0xff, 0},
++	{0x9e, 0x20, 0x3f, 0},
++	{0x9d, 0x07, 0x00, 0},
++	{0x49, 0x90, 0xf0, 0},
++	{0x87, 0xd0, 0xf0, 0},
++	{0x90, 0x10, 0xff, 0},
++	{0x9d, 0x07, 0x00, 0},
++	{0x9e, 0x20, 0x3f, 0},
++	{REG_06, 0x00, 0x1f, 0},
++};
++
++static struct tas2101_regtable tas2101_setfe[] = {
++	{REG_04, 0x08, 0x00, 0},
++	{0x36, 0x01, 0x00, 0},
++	{0x56, 0x01, 0x81, 0},
++	{0x05, 0x08, 0x00, 0},
++	{0x36, 0x40, 0x00, 0},
++	{0x58, 0x60, 0xe0, 0},
++};
++
++struct tas2101_snrtable_pair {
++	u16 snr;
++	u16 raw;
++};
++
++static struct tas2101_snrtable_pair tas2101_snrtable[] =  {
++	{10, 0x65a}, /* 1.0 dB */
++	{20, 0x50c},
++	{30, 0x402},
++	{40, 0x32f},
++	{50, 0x287},
++	{60, 0x202},
++	{70, 0x198},
++	{80, 0x144},
++	{90, 0x100},
++	{100, 0xcc},
++	{110, 0xa2},
++	{120, 0x81},
++	{130, 0x66},
++	{140, 0x51},
++	{150, 0x40},
++	{160, 0x33},
++	{170, 0x28},
++	{180, 0x20},
++	{190, 0x19},
++	{200, 0x14},
++	{210, 0x10},
++	{220, 0xc},
++	{230, 0xa},
++	{240, 0x8},
++	{250, 0x6},
++	{260, 0x5},
++	{270, 0x4},
++	{280, 0x3},
++	{300, 0x2},
++	{330, 0x1}, /* 33.0 dB */
++	{0, 0}
++};
++
++struct tas2101_dbmtable_pair {
++	s32 dbm;
++	u16 raw;
++};
++
++static struct tas2101_dbmtable_pair tas2101_dbmtable[] =  {
++	{ -1000, 0xfff},
++	{ -900, 0x778},
++	{ -800, 0x621},
++	{ -700, 0x55c},  
++	{ -600, 0x40e},
++	{ -500, 0x343},
++	{ -400, 0x2b7},
++	{ -300, 0x231},
++	{ -200, 0x1a1},
++	{ 0, 0},
++};
++
++/* modfec (modulation and FEC) lookup table */
++struct tas2101_modfec {
++	enum fe_delivery_system delivery_system;
++	enum fe_modulation modulation;
++	enum fe_code_rate fec;
++};
++
++static struct tas2101_modfec tas2101_modfec_modes[] = {
++	{ SYS_DVBS, QPSK, FEC_AUTO },
++	{ SYS_DVBS, QPSK, FEC_1_2 },
++	{ SYS_DVBS, QPSK, FEC_2_3 },
++	{ SYS_DVBS, QPSK, FEC_3_4 },
++	{ SYS_DVBS, QPSK, FEC_4_5 },
++	{ SYS_DVBS, QPSK, FEC_5_6 },
++	{ SYS_DVBS, QPSK, FEC_6_7 },
++	{ SYS_DVBS, QPSK, FEC_7_8 },
++	{ SYS_DVBS, QPSK, FEC_8_9 },
++
++	{ SYS_DVBS2, QPSK, FEC_1_2 },
++	{ SYS_DVBS2, QPSK, FEC_3_5 },
++	{ SYS_DVBS2, QPSK, FEC_2_3 },
++	{ SYS_DVBS2, QPSK, FEC_3_4 },
++	{ SYS_DVBS2, QPSK, FEC_4_5 },
++	{ SYS_DVBS2, QPSK, FEC_5_6 },
++	{ SYS_DVBS2, QPSK, FEC_8_9 },
++	{ SYS_DVBS2, QPSK, FEC_9_10 },
++
++	{ SYS_DVBS2, PSK_8, FEC_3_5 },
++	{ SYS_DVBS2, PSK_8, FEC_2_3 },
++	{ SYS_DVBS2, PSK_8, FEC_3_4 },
++	{ SYS_DVBS2, PSK_8, FEC_5_6 },
++	{ SYS_DVBS2, PSK_8, FEC_8_9 },
++	{ SYS_DVBS2, PSK_8, FEC_9_10 },
++
++	{ SYS_DVBS2, APSK_16, FEC_2_3 },
++	{ SYS_DVBS2, APSK_16, FEC_3_4 },
++	{ SYS_DVBS2, APSK_16, FEC_4_5 },
++	{ SYS_DVBS2, APSK_16, FEC_5_6 },
++	{ SYS_DVBS2, APSK_16, FEC_8_9 },
++	{ SYS_DVBS2, APSK_16, FEC_9_10 },
++
++	{ SYS_DVBS2, APSK_32, FEC_3_4 },
++	{ SYS_DVBS2, APSK_32, FEC_4_5 },
++	{ SYS_DVBS2, APSK_32, FEC_5_6 },
++	{ SYS_DVBS2, APSK_32, FEC_8_9 },
++	{ SYS_DVBS2, APSK_32, FEC_9_10 },
++};
++
++#endif /* TAS2101_PRIV_H */
+diff -urN linux.orig/drivers/media/pci/Kconfig linux/drivers/media/pci/Kconfig
+--- linux.orig/drivers/media/pci/Kconfig	2024-08-04 19:51:34.483241698 +0100
++++ linux/drivers/media/pci/Kconfig	2024-08-04 19:54:58.288705243 +0100
+@@ -58,6 +58,7 @@
+ source "drivers/media/pci/pt1/Kconfig"
+ source "drivers/media/pci/pt3/Kconfig"
+ source "drivers/media/pci/smipcie/Kconfig"
++source "drivers/media/pci/tbsecp3/Kconfig"
+ source "drivers/media/pci/ttpci/Kconfig"
+ 
+ endif
+diff -urN linux.orig/drivers/media/pci/Makefile linux/drivers/media/pci/Makefile
+--- linux.orig/drivers/media/pci/Makefile	2024-08-04 19:51:34.483241698 +0100
++++ linux/drivers/media/pci/Makefile	2024-08-04 19:54:38.596562529 +0100
+@@ -17,6 +17,7 @@
+ 		saa7146/	\
+ 		smipcie/	\
+ 		netup_unidvb/	\
++		tbsecp3/	\
+ 		intel/		\
+ 		hailo/
+ 
+diff -urN linux.orig/drivers/media/pci/tbsecp3/Kconfig linux/drivers/media/pci/tbsecp3/Kconfig
+--- linux.orig/drivers/media/pci/tbsecp3/Kconfig	1970-01-01 01:00:00.000000000 +0100
++++ linux/drivers/media/pci/tbsecp3/Kconfig	2024-08-04 19:53:33.612091581 +0100
+@@ -0,0 +1,23 @@
++config DVB_TBSECP3
++	tristate "TBS ECP3 FPGA based cards"
++	depends on DVB_CORE && PCI && I2C
++	select I2C_ALGOBIT
++	select DVB_TAS2101 if MEDIA_SUBDRV_AUTOSELECT
++	select MEDIA_TUNER_AV201X if MEDIA_SUBDRV_AUTOSELECT
++	select DVB_STV091X if MEDIA_SUBDRV_AUTOSELECT
++	select MEDIA_TUNER_STV6120 if MEDIA_SUBDRV_AUTOSELECT
++	select DVB_SI2168 if MEDIA_SUBDRV_AUTOSELECT
++	select MEDIA_TUNER_SI2157 if MEDIA_SUBDRV_AUTOSELECT
++	select DVB_MXL58X if MEDIA_SUBDRV_AUTOSELECT
++	select DVB_SI2183 if MEDIA_SUBDRV_AUTOSELECT
++	select DVB_MN88436 if MEDIA_SUBDRV_AUTOSELECT
++	select MEDIA_TUNER_MXL603 if MEDIA_SUBDRV_AUTOSELECT
++	select DVB_GX1503 if MEDIA_SUBDRV_AUTOSELECT
++	select DVB_MTV23X if MEDIA_SUBDRV_AUTOSELECT
++	select DVB_TAS2971 if MEDIA_SUBDRV_AUTOSELECT
++	select DVB_STID135 if MEDIA_SUBDRV_AUTOSELECT
++	help
++	  Support for cards with TBS ECP3 FPGA based PCIe bridge.
++
++	  Say Y or M if you own such a device and want to use it.
++	  If unsure say N.
+diff -urN linux.orig/drivers/media/pci/tbsecp3/Makefile linux/drivers/media/pci/tbsecp3/Makefile
+--- linux.orig/drivers/media/pci/tbsecp3/Makefile	1970-01-01 01:00:00.000000000 +0100
++++ linux/drivers/media/pci/tbsecp3/Makefile	2024-08-04 19:53:33.612091581 +0100
+@@ -0,0 +1,9 @@
++
++tbsecp3-objs	:= tbsecp3-core.o tbsecp3-cards.o tbsecp3-i2c.o tbsecp3-dma.o tbsecp3-dvb.o tbsecp3-ca.o tbsecp3-asi.o
++
++obj-$(CONFIG_DVB_TBSECP3) += tbsecp3.o
++
++ccflags-y += -Idrivers/media/tuners
++ccflags-y += -Idrivers/media/dvb-core
++ccflags-y += -Idrivers/media/dvb-frontends
++ccflags-y += -Idrivers/media/dvb-frontends/stid135
+diff -urN linux.orig/drivers/media/pci/tbsecp3/tbsecp3-asi.c linux/drivers/media/pci/tbsecp3/tbsecp3-asi.c
+--- linux.orig/drivers/media/pci/tbsecp3/tbsecp3-asi.c	1970-01-01 01:00:00.000000000 +0100
++++ linux/drivers/media/pci/tbsecp3/tbsecp3-asi.c	2024-08-04 19:53:33.612091581 +0100
+@@ -0,0 +1,103 @@
++
++#include "tbsecp3.h"
++
++u8 asi_CheckFree(struct tbsecp3_dev *dev,int asi_base_addr, unsigned char OpbyteNum)
++	{
++		unsigned char tmpbuf[4];
++		int i;
++		int j=500;
++		if(OpbyteNum==2)
++			j=400;
++		else if(OpbyteNum==1)
++			j=200;	
++		//pauseThread(OpbyteNum+1);
++	
++		tmpbuf[0] = 0;
++		for(i=0;(i<j) && (tmpbuf[0] != 1);i++)
++		{
++			*(u32 *)tmpbuf = tbs_read(asi_base_addr, ASI_STATUS );  
++		}
++		//return (tmpbuf[0] == 1);
++	
++		if(tmpbuf[0] == 1)
++			return true;
++		else
++		{
++			printk("----------asi spi interface check error! %x\n",tmpbuf[0]);
++			return false;
++		} 
++	}
++
++
++bool asi_chip_reset(struct tbsecp3_dev *dev,int asi_base_addr)
++{
++	unsigned char tmpbuf[4];
++
++	tmpbuf[0] = 0;
++	tbs_write( asi_base_addr, ASI_CHIP_RST, *(u32 *)&tmpbuf[0]);
++
++	msleep(20);
++
++	tmpbuf[0] = 1;
++	tbs_write( asi_base_addr, ASI_CHIP_RST, *(u32 *)&tmpbuf[0]);
++	
++	msleep(100);
++	return true ;
++}
++int asi_read16bit(struct tbsecp3_dev *dev,int asi_base_addr,int reg_addr)
++{
++	unsigned char tmpbuf[4];
++	int regData;
++
++	tmpbuf[0] = (unsigned char) (reg_addr>>8)&0xff; //read_address, msb first;
++	tmpbuf[1] = (unsigned char)(reg_addr&0xff);
++	tmpbuf[0] += 0x80;  //read data;
++
++	
++	tbs_write( asi_base_addr, ASI_SPI_CMD, *(u32 *)&tmpbuf[0]);
++	
++	tmpbuf[0] = 0xf0;	//cs low,cs high, write, read;	
++	tmpbuf[1] = 0x20;	// 2 bytes command for writing;
++    tmpbuf[1] += 0x02;	 //read 2 bytes data;
++	tbs_write( asi_base_addr, ASI_SPI_CONFIG, *(u32 *)&tmpbuf[0]);
++
++	if(asi_CheckFree(dev,asi_base_addr,2)== false)
++	{
++		printk(" spi_read16bit error!\n");
++		return false;	
++	}                   
++
++	*(u32 *)tmpbuf =  tbs_read(asi_base_addr, ASI_SPI_RD_32 ); 
++
++	regData = ((tmpbuf[0]<<8) | tmpbuf[1]);
++
++	return regData;
++}
++
++bool asi_write16bit(struct tbsecp3_dev *dev,int asi_base_addr, int reg_addr, int data16bit)
++{
++	unsigned char tmpbuf[4];
++	int regData;
++
++	tmpbuf[0] = (unsigned char) (reg_addr>>8)&0xff; //read_address, msb first;
++	tmpbuf[1] = (unsigned char)(reg_addr&0xff);
++
++	tmpbuf[2] = (unsigned char) (data16bit>>8)&0xff; //read_address, msb first;
++	tmpbuf[3] = (unsigned char)(data16bit&0xff);
++
++	tbs_write( asi_base_addr, ASI_SPI_CMD, *(u32 *)&tmpbuf[0]);
++	
++	tmpbuf[0] = 0xe0;	//cs low,cs high, write, no read;	
++	tmpbuf[1] = 0x40;	// 4 bytes command for writing;
++	tbs_write( asi_base_addr, ASI_SPI_CONFIG, *(u32 *)&tmpbuf[0]);
++
++	if(asi_CheckFree(dev,asi_base_addr,2)== false)
++	{
++		printk(" spi_write16bit error!\n");
++		return false;	
++	}                   
++	return true ;
++}
++
++
++
+diff -urN linux.orig/drivers/media/pci/tbsecp3/tbsecp3-ca.c linux/drivers/media/pci/tbsecp3/tbsecp3-ca.c
+--- linux.orig/drivers/media/pci/tbsecp3/tbsecp3-ca.c	1970-01-01 01:00:00.000000000 +0100
++++ linux/drivers/media/pci/tbsecp3/tbsecp3-ca.c	2024-08-04 19:53:33.612091581 +0100
+@@ -0,0 +1,278 @@
++/*
++    TBS ECP3 FPGA based cards PCIe driver
++
++    This program is free software: you can redistribute it and/or modify
++    it under the terms of the GNU General Public License as published by
++    the Free Software Foundation, either version 3 of the License, or
++    (at your option) any later version.
++
++    This program is distributed in the hope that it will be useful,
++    but WITHOUT ANY WARRANTY; without even the implied warranty of
++    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++    GNU General Public License for more details.
++
++    You should have received a copy of the GNU General Public License
++    along with this program.  If not, see <http://www.gnu.org/licenses/>.
++*/
++
++#include "tbsecp3.h"
++
++static int tbsecp3_ca_rd_attr_mem(struct dvb_ca_en50221 *ca,
++	int slot, int address)
++{
++	struct tbsecp3_ca *tbsca = ca->data;
++	struct tbsecp3_adapter *adapter = tbsca->adapter;
++	struct tbsecp3_dev *dev = adapter->dev;
++	u32 data = 0;
++
++	if (slot != 0)
++		return -EINVAL;
++
++	mutex_lock(&tbsca->lock);
++
++	data |= (address >> 8) & 0x7f;
++	data |= (address & 0xff) << 8;
++	tbs_write(TBSECP3_CA_BASE(tbsca->nr), 0x00, data);
++	udelay(150);
++
++	data = tbs_read(TBSECP3_CA_BASE(tbsca->nr), 0x04);
++
++	mutex_unlock(&tbsca->lock);
++
++	return (data & 0xff);
++}
++
++static int tbsecp3_ca_wr_attr_mem(struct dvb_ca_en50221 *ca,
++	int slot, int address, u8 value)
++{
++	struct tbsecp3_ca *tbsca = ca->data;
++	struct tbsecp3_adapter *adapter =
++			(struct tbsecp3_adapter *) tbsca->adapter;
++	struct tbsecp3_dev *dev = adapter->dev;
++	u32 data = 0;
++
++	if (slot != 0)
++		return -EINVAL;
++
++	mutex_lock(&tbsca->lock);
++
++	data |= (address >> 8) & 0x7f;
++	data |= (address & 0xff) << 8;
++	data |= 0x01 << 16;
++	data |= value << 24;
++	tbs_write(TBSECP3_CA_BASE(tbsca->nr), 0x00, data);
++	udelay(150);
++
++	mutex_unlock(&tbsca->lock);
++
++	return 0;
++}
++
++static int tbsecp3_ca_rd_cam_ctrl(struct dvb_ca_en50221 *ca, 
++	int slot, u8 address)
++{
++	struct tbsecp3_ca *tbsca = ca->data;
++	struct tbsecp3_adapter *adapter =
++			(struct tbsecp3_adapter *) tbsca->adapter;
++	struct tbsecp3_dev *dev = adapter->dev;
++	u32 data = 0;
++
++	if (slot != 0)
++		return -EINVAL;
++
++	mutex_lock(&tbsca->lock);
++
++	data |= (address & 3) << 8;
++	data |= 0x02 << 16;
++	tbs_write(TBSECP3_CA_BASE(tbsca->nr), 0x00, data);
++	udelay(150);
++	
++	data = tbs_read(TBSECP3_CA_BASE(tbsca->nr), 0x08);
++
++	mutex_unlock(&tbsca->lock);
++
++	return (data & 0xff);
++}
++
++static int tbsecp3_ca_wr_cam_ctrl(struct dvb_ca_en50221 *ca, int slot,
++	u8 address, u8 value)
++{
++	struct tbsecp3_ca *tbsca = ca->data;
++	struct tbsecp3_adapter *adapter =
++			(struct tbsecp3_adapter *) tbsca->adapter;
++	struct tbsecp3_dev *dev = adapter->dev;
++	u32 data = 0;
++
++	if (slot != 0)
++		return -EINVAL;
++
++	mutex_lock(&tbsca->lock);
++
++	data |= (address & 3) << 8;
++	data |= 0x03 << 16;
++	data |= value << 24;
++	tbs_write(TBSECP3_CA_BASE(tbsca->nr), 0x00, data);
++	udelay(150);
++
++	mutex_unlock(&tbsca->lock);
++
++	return 0;
++}
++
++static int tbsecp3_ca_slot_reset(struct dvb_ca_en50221 *ca, int slot)
++{
++	struct tbsecp3_ca *tbsca = ca->data;
++	struct tbsecp3_adapter *adapter =
++			(struct tbsecp3_adapter *) tbsca->adapter;
++	struct tbsecp3_dev *dev = adapter->dev;
++
++	if (slot != 0)
++		return -EINVAL;
++	
++	mutex_lock(&tbsca->lock);
++
++	tbs_write(TBSECP3_CA_BASE(tbsca->nr), 0x04, 1);
++	msleep (10);
++
++	tbs_write(TBSECP3_CA_BASE(tbsca->nr), 0x04, 0);
++	msleep (2800);
++
++	mutex_unlock (&tbsca->lock);
++	return 0;
++}
++
++static int tbsecp3_ca_slot_ctrl(struct dvb_ca_en50221 *ca,
++	int slot, int enable)
++{
++	struct tbsecp3_ca *tbsca = ca->data;
++	struct tbsecp3_adapter *adapter = 
++			(struct tbsecp3_adapter *) tbsca->adapter;
++	struct tbsecp3_dev *dev = adapter->dev;
++	u32 data;
++
++	if (slot != 0)
++		return -EINVAL;
++
++	mutex_lock(&tbsca->lock);
++
++	data = enable & 1;
++	tbs_write(TBSECP3_CA_BASE(tbsca->nr), 0x0c, data);
++
++	mutex_unlock(&tbsca->lock);
++
++	dev_info(&dev->pci_dev->dev, "CA slot %sabled for adapter%d\n",
++		enable ? "en" : "dis",
++		adapter->fe->dvb->num);
++
++	return 0;
++}
++
++static int tbsecp3_ca_slot_shutdown(struct dvb_ca_en50221 *ca, int slot)
++{
++	return tbsecp3_ca_slot_ctrl(ca, slot, 0);
++}
++
++static int tbsecp3_ca_slot_ts_enable(struct dvb_ca_en50221 *ca, int slot)
++{
++	return tbsecp3_ca_slot_ctrl(ca, slot, 1);
++}
++
++static int tbsecp3_ca_poll_slot_status(struct dvb_ca_en50221 *ca, 
++	int slot, int open)
++{
++	struct tbsecp3_ca *tbsca = ca->data;
++	struct tbsecp3_adapter *adapter =
++			(struct tbsecp3_adapter *) tbsca->adapter;
++	struct tbsecp3_dev *dev = adapter->dev;
++	u32 data;
++	int ret;
++
++	if (slot != 0)
++		return -EINVAL;
++
++	mutex_lock(&tbsca->lock);
++	data = tbs_read(TBSECP3_CA_BASE(tbsca->nr), 0x0c) & 1;
++	if (tbsca->status != data){
++		tbs_write(TBSECP3_CA_BASE(tbsca->nr), 0x08, !data);
++		msleep(300);
++		tbsca->status = data;
++	}
++	mutex_unlock(&tbsca->lock);
++
++	if (data & 1)
++		ret = DVB_CA_EN50221_POLL_CAM_PRESENT |
++		      DVB_CA_EN50221_POLL_CAM_READY;
++	else
++		ret = 0;
++
++	return ret;
++}
++
++
++struct dvb_ca_en50221 ca_config = {
++	.read_attribute_mem  = tbsecp3_ca_rd_attr_mem,
++	.write_attribute_mem = tbsecp3_ca_wr_attr_mem,
++	.read_cam_control    = tbsecp3_ca_rd_cam_ctrl,
++	.write_cam_control   = tbsecp3_ca_wr_cam_ctrl,
++	.slot_reset          = tbsecp3_ca_slot_reset,
++	.slot_shutdown       = tbsecp3_ca_slot_shutdown,
++	.slot_ts_enable      = tbsecp3_ca_slot_ts_enable,
++	.poll_slot_status    = tbsecp3_ca_poll_slot_status,
++};
++
++
++int tbsecp3_ca_init(struct tbsecp3_adapter *adap, int nr)
++{
++	struct tbsecp3_dev *dev = adap->dev;
++	struct tbsecp3_ca *tbsca;
++	int ret;
++
++	tbsca = kzalloc(sizeof(struct tbsecp3_ca), GFP_KERNEL);
++	if (tbsca == NULL) {
++		ret = -ENOMEM;
++		goto error1;
++	}
++
++	adap->tbsca = tbsca;
++
++	tbsca->nr = nr;
++	tbsca->status = 0;
++	tbsca->adapter = adap;
++	mutex_init(&tbsca->lock);
++
++	memcpy(&tbsca->ca, &ca_config, sizeof(struct dvb_ca_en50221));
++	tbsca->ca.owner = THIS_MODULE;
++	tbsca->ca.data = tbsca;
++
++	dev_info(&dev->pci_dev->dev,
++		"initializing CA slot %d on adapter %d\n",
++		nr, adap->dvb_adapter.num);
++
++	ret = dvb_ca_en50221_init(&adap->dvb_adapter, &tbsca->ca, 0, 1);
++	if (ret)
++		goto error2;
++
++	return 0;
++
++error2: 
++	kfree(tbsca);
++error1:
++	dev_err(&dev->pci_dev->dev,
++		"adapter %d CA slot initialization failed\n",
++		adap->dvb_adapter.num);
++	return ret;
++}
++
++void tbsecp3_ca_release(struct tbsecp3_adapter *adap)
++{
++	struct tbsecp3_ca *tbsca = adap->tbsca;
++	if (!adap)
++		return;
++	if (!tbsca)
++		return;
++	if (!tbsca->ca.data)
++		return;
++	dvb_ca_en50221_release(&tbsca->ca);
++	kfree(tbsca);
++}
++
+diff -urN linux.orig/drivers/media/pci/tbsecp3/tbsecp3-cards.c linux/drivers/media/pci/tbsecp3/tbsecp3-cards.c
+--- linux.orig/drivers/media/pci/tbsecp3/tbsecp3-cards.c	1970-01-01 01:00:00.000000000 +0100
++++ linux/drivers/media/pci/tbsecp3/tbsecp3-cards.c	2024-08-04 19:53:33.612091581 +0100
+@@ -0,0 +1,1777 @@
++/*
++    TBS ECP3 FPGA based cards PCIe driver
++
++    This program is free software: you can redistribute it and/or modify
++    it under the terms of the GNU General Public License as published by
++    the Free Software Foundation, either version 3 of the License, or
++    (at your option) any later version.
++
++    This program is distributed in the hope that it will be useful,
++    but WITHOUT ANY WARRANTY; without even the implied warranty of
++    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++    GNU General Public License for more details.
++
++    You should have received a copy of the GNU General Public License
++    along with this program.  If not, see <http://www.gnu.org/licenses/>.
++*/
++
++#include "tbsecp3.h"
++
++struct tbsecp3_board tbsecp3_boards[] = {
++	[TBSECP3_BOARD_TBS6916] = {
++		.board_id	= TBSECP3_BOARD_TBS6916,
++		.name		= "TurboSight TBS 6916 (Octa DVB-S/S2/S2X)",
++		.adapters	= 16,
++		.i2c_speed	= 39,
++		.eeprom_i2c	= 1,
++		.eeprom_addr	= 0x02,
++		.adap_config	= {
++			{
++				.ts_in = 0,
++				.i2c_bus_nr = 0,
++				.gpio.demod_reset.lvl = TBSECP3_GPIODEF_LOW,
++				.gpio.demod_reset.nr  = TBSECP3_GPIO_PIN(0, 0),
++			}, 
++			{
++				.ts_in = 1,
++				.i2c_bus_nr = 0,
++			},
++			{
++				.ts_in = 2,
++				.i2c_bus_nr = 0,
++			},
++			{
++				.ts_in = 3,
++				.i2c_bus_nr = 0,
++			},
++			{
++				.ts_in = 4,
++				.i2c_bus_nr = 0,
++			},
++			{
++				.ts_in = 5,
++				.i2c_bus_nr = 0,
++			},
++			{
++				.ts_in = 6,
++				.i2c_bus_nr = 0,
++			},
++			{
++				.ts_in = 7,
++				.i2c_bus_nr = 0,
++			},
++			{
++				.ts_in = 8,
++				.i2c_bus_nr = 1,
++				.gpio.demod_reset.lvl = TBSECP3_GPIODEF_LOW,
++				.gpio.demod_reset.nr  = TBSECP3_GPIO_PIN(1, 0),
++			}, 
++			{
++				.ts_in = 9,
++				.i2c_bus_nr = 1,
++			},
++			{
++				.ts_in = 10,
++				.i2c_bus_nr = 1,
++			},
++			{
++				.ts_in = 11,
++				.i2c_bus_nr = 1,
++			},
++			{
++				.ts_in = 12,
++				.i2c_bus_nr = 1,
++			},
++			{
++				.ts_in = 13,
++				.i2c_bus_nr = 1,
++			},
++			{
++				.ts_in = 14,
++				.i2c_bus_nr = 1,
++			},
++			{
++				.ts_in = 15,
++				.i2c_bus_nr = 1,
++			}
++
++		}
++	},
++	[TBSECP3_BOARD_TBS6590SE] = {
++		.board_id	= TBSECP3_BOARD_TBS6590SE,
++		.name		= "TurboSight TBS 6590SE DVB-S/S2/S2X/T/T2/C/C2 + 2xCI ",
++		.adapters	= 2,
++		.i2c_speed	= 39,
++		.eeprom_i2c	= 0,
++		.eeprom_addr = 0x10,
++		.adap_config	= {
++			{
++				.ts_in = 0,
++				.i2c_bus_nr = 0,
++				.gpio.demod_reset.lvl = TBSECP3_GPIODEF_LOW,
++				.gpio.demod_reset.nr  = TBSECP3_GPIO_PIN(0, 0),
++
++			},
++			{
++				.ts_in = 1,
++				.i2c_bus_nr = 1,
++				.gpio.demod_reset.lvl = TBSECP3_GPIODEF_LOW,
++				.gpio.demod_reset.nr  = TBSECP3_GPIO_PIN(1, 0),
++
++			},
++		}
++	},
++	[TBSECP3_BOARD_TBS6504H] = {
++		.board_id	= TBSECP3_BOARD_TBS6504H,
++		.name		= "TurboSight TBS 6504H Quad DVBS/S2x + Quad DVB-T/T2/C ISDB-T/C ATSC1.0",
++		.i2c_speed	= 39,
++		.eeprom_i2c	= 3,
++		.eeprom_addr = 0x10,
++		.adapters	= 8,
++		.adap_config	= {
++			{
++				.ts_in = 0,
++				.i2c_bus_nr = 0,
++				.gpio.lnb_power.lvl   = TBSECP3_GPIODEF_HIGH,
++				.gpio.lnb_power.nr    = TBSECP3_GPIO_PIN(0, 2),
++				.gpio.lnb_voltage.lvl = TBSECP3_GPIODEF_HIGH,
++				.gpio.lnb_voltage.nr  = TBSECP3_GPIO_PIN(0, 1),		
++			}, 
++			{
++				.ts_in = 1,
++				.i2c_bus_nr = 0,
++				.gpio.lnb_power.lvl   = TBSECP3_GPIODEF_HIGH,
++				.gpio.lnb_power.nr    = TBSECP3_GPIO_PIN(1, 2),
++				.gpio.lnb_voltage.lvl = TBSECP3_GPIODEF_HIGH,
++				.gpio.lnb_voltage.nr  = TBSECP3_GPIO_PIN(1, 1),				
++			},
++			{
++				.ts_in = 2,
++				.i2c_bus_nr = 1,
++				.gpio.lnb_power.lvl   = TBSECP3_GPIODEF_HIGH,
++				.gpio.lnb_power.nr    = TBSECP3_GPIO_PIN(2, 2),
++				.gpio.lnb_voltage.lvl = TBSECP3_GPIODEF_HIGH,
++				.gpio.lnb_voltage.nr  = TBSECP3_GPIO_PIN(2, 1),
++			},
++			{
++				.ts_in = 3,
++				.i2c_bus_nr = 1,
++				.gpio.lnb_power.lvl   = TBSECP3_GPIODEF_HIGH,
++				.gpio.lnb_power.nr    = TBSECP3_GPIO_PIN(3, 2),
++				.gpio.lnb_voltage.lvl = TBSECP3_GPIODEF_HIGH,
++	                       .gpio.lnb_voltage.nr  = TBSECP3_GPIO_PIN(3, 1),				
++			},
++			{
++				.ts_in = 4,
++				.i2c_bus_nr = 2,
++
++			},
++			{
++				.ts_in = 5,
++				.i2c_bus_nr = 2,
++			},
++			{
++				.ts_in = 6,
++				.i2c_bus_nr = 3,
++			},
++			{
++				.ts_in = 7,
++				.i2c_bus_nr = 3,
++			},												
++		}
++	},
++	[TBSECP3_BOARD_TBS6522H] = {
++		.board_id	= TBSECP3_BOARD_TBS6522H,
++		.name		= "TurboSight TBS 6522H Dual DVBS/S2x + Dual DVB-T/T2/C ISDB-T/C ATSC1.0",
++		.i2c_speed	= 39,
++		.eeprom_i2c	= 3,
++		.eeprom_addr = 0x10,
++		.adapters	= 4,
++		.adap_config	= {
++			{
++				.ts_in = 0,
++				.i2c_bus_nr = 0,
++				.gpio.demod_reset.lvl = TBSECP3_GPIODEF_LOW,
++				.gpio.demod_reset.nr  = TBSECP3_GPIO_PIN(0, 0),
++			}, 
++			{
++				.ts_in = 1,
++				.i2c_bus_nr = 1,
++				.gpio.demod_reset.lvl = TBSECP3_GPIODEF_LOW,
++				.gpio.demod_reset.nr  = TBSECP3_GPIO_PIN(1, 0),
++			},
++			{
++				.ts_in = 2,
++				.i2c_bus_nr = 2,
++				.gpio.demod_reset.lvl = TBSECP3_GPIODEF_LOW,
++				.gpio.demod_reset.nr  = TBSECP3_GPIO_PIN(2, 0),
++				.gpio.lnb_power.lvl   = TBSECP3_GPIODEF_HIGH,
++				.gpio.lnb_power.nr    = TBSECP3_GPIO_PIN(2, 2),
++				.gpio.lnb_voltage.lvl = TBSECP3_GPIODEF_HIGH,
++				.gpio.lnb_voltage.nr  = TBSECP3_GPIO_PIN(2, 1),
++			},
++			{
++				.ts_in = 3,
++				.i2c_bus_nr = 3,
++				.gpio.demod_reset.lvl = TBSECP3_GPIODEF_LOW,
++				.gpio.demod_reset.nr  = TBSECP3_GPIO_PIN(3, 0),
++				.gpio.lnb_power.lvl   = TBSECP3_GPIODEF_HIGH,
++				.gpio.lnb_power.nr    = TBSECP3_GPIO_PIN(3, 2),
++				.gpio.lnb_voltage.lvl = TBSECP3_GPIODEF_HIGH,
++	                       .gpio.lnb_voltage.nr  = TBSECP3_GPIO_PIN(3, 1),				
++			}
++		}
++	},
++	[TBSECP3_BOARD_TBS6909SE] = {
++		.board_id	= TBSECP3_BOARD_TBS6909SE,
++		.name		= "Turbosight TBS 6909SE(Octa DVB-S/S2/S2x)",
++		.i2c_speed  = 39,
++		.eeprom_i2c	= 3,
++		.eeprom_addr = 0x10,
++		.adapters	= 8,
++		.adap_config ={
++			{
++				.ts_in = 0,
++				.i2c_bus_nr = 0,
++				.gpio.lnb_power.lvl   = TBSECP3_GPIODEF_HIGH,
++				.gpio.lnb_power.nr    = TBSECP3_GPIO_PIN(0, 2),
++				.gpio.lnb_voltage.lvl = TBSECP3_GPIODEF_HIGH,
++				.gpio.lnb_voltage.nr  = TBSECP3_GPIO_PIN(0, 1),	
++			}, 
++			{
++				.ts_in = 1,
++				.i2c_bus_nr = 0,
++				.gpio.lnb_power.lvl   = TBSECP3_GPIODEF_HIGH,
++				.gpio.lnb_power.nr    = TBSECP3_GPIO_PIN(0, 2),
++				.gpio.lnb_voltage.lvl = TBSECP3_GPIODEF_HIGH,
++				.gpio.lnb_voltage.nr  = TBSECP3_GPIO_PIN(0, 1),	
++			},
++			{
++				.ts_in = 2,
++				.i2c_bus_nr = 1,
++				.gpio.lnb_power.lvl   = TBSECP3_GPIODEF_HIGH,
++				.gpio.lnb_power.nr    = TBSECP3_GPIO_PIN(1, 2),
++				.gpio.lnb_voltage.lvl = TBSECP3_GPIODEF_HIGH,
++				.gpio.lnb_voltage.nr  = TBSECP3_GPIO_PIN(1, 1),
++			},
++			{
++				.ts_in = 3,
++				.i2c_bus_nr = 1,
++				.gpio.lnb_power.lvl   = TBSECP3_GPIODEF_HIGH,
++				.gpio.lnb_power.nr    = TBSECP3_GPIO_PIN(1, 2),
++				.gpio.lnb_voltage.lvl = TBSECP3_GPIODEF_HIGH,
++				.gpio.lnb_voltage.nr  = TBSECP3_GPIO_PIN(1, 1),	
++			},
++			{
++				.ts_in = 4,
++				.i2c_bus_nr = 2,
++				.gpio.lnb_power.lvl   = TBSECP3_GPIODEF_HIGH,
++				.gpio.lnb_power.nr    = TBSECP3_GPIO_PIN(2, 2),
++				.gpio.lnb_voltage.lvl = TBSECP3_GPIODEF_HIGH,
++				.gpio.lnb_voltage.nr  = TBSECP3_GPIO_PIN(2, 1),
++			},
++			{
++				.ts_in = 5,
++				.i2c_bus_nr = 2,
++				.gpio.lnb_power.lvl   = TBSECP3_GPIODEF_HIGH,
++				.gpio.lnb_power.nr    = TBSECP3_GPIO_PIN(2, 2),
++				.gpio.lnb_voltage.lvl = TBSECP3_GPIODEF_HIGH,
++				.gpio.lnb_voltage.nr  = TBSECP3_GPIO_PIN(2, 1),				
++			},
++			{
++				.ts_in = 6,
++				.i2c_bus_nr = 3,
++				.gpio.lnb_power.lvl   = TBSECP3_GPIODEF_HIGH,
++				.gpio.lnb_power.nr    = TBSECP3_GPIO_PIN(3, 2),
++				.gpio.lnb_voltage.lvl = TBSECP3_GPIODEF_HIGH,
++				.gpio.lnb_voltage.nr  = TBSECP3_GPIO_PIN(3, 1),				
++
++			},
++			{
++				.ts_in = 7,
++				.i2c_bus_nr = 3,
++				.gpio.lnb_power.lvl   = TBSECP3_GPIODEF_HIGH,
++				.gpio.lnb_power.nr    = TBSECP3_GPIO_PIN(3, 2),
++				.gpio.lnb_voltage.lvl = TBSECP3_GPIODEF_HIGH,
++				.gpio.lnb_voltage.nr  = TBSECP3_GPIO_PIN(3, 1),				
++			}
++
++		}
++	},
++	[TBSECP3_BOARD_TBS6281TD] = {
++		.board_id	= TBSECP3_BOARD_TBS6281TD,
++		.name		= "TurboSight TBS 6281TD DVB-T/T2/C ISDB-T/C ATSC1.0",
++		.i2c_speed	= 39,
++		.eeprom_i2c	= 0,
++		.eeprom_addr = 0x10,
++		.adapters	= 2,
++		.adap_config	= {
++			{
++				.ts_in = 0,
++				.i2c_bus_nr = 0,
++				.gpio.demod_reset.lvl = TBSECP3_GPIODEF_LOW,
++				.gpio.demod_reset.nr  = TBSECP3_GPIO_PIN(0, 0),
++			}, 
++			{
++				.ts_in = 1,
++				.i2c_bus_nr = 1,
++				.gpio.demod_reset.lvl = TBSECP3_GPIODEF_LOW,
++				.gpio.demod_reset.nr  = TBSECP3_GPIO_PIN(1, 0),
++			},
++		}
++	},
++	[TBSECP3_BOARD_TBS6205SE] = {
++		.board_id	= TBSECP3_BOARD_TBS6205SE,
++		.name		= "TurboSight TBS 6205SE DVB-T/T2/C ISDB-T/C ATSC1.0",
++		.i2c_speed	= 39,
++		.eeprom_i2c	= 2,
++		.eeprom_addr = 0x10,
++		.adapters	= 4,
++		.adap_config	= {
++			{
++				.ts_in = 0,
++				.i2c_bus_nr = 0,
++				.gpio.demod_reset.lvl = TBSECP3_GPIODEF_LOW,
++				.gpio.demod_reset.nr  = TBSECP3_GPIO_PIN(0, 0),
++			}, 
++			{
++				.ts_in = 1,
++				.i2c_bus_nr = 1,
++				.gpio.demod_reset.lvl = TBSECP3_GPIODEF_LOW,
++				.gpio.demod_reset.nr  = TBSECP3_GPIO_PIN(1, 0),
++			},
++			{
++				.ts_in = 2,
++				.i2c_bus_nr = 2,
++				.gpio.demod_reset.lvl = TBSECP3_GPIODEF_LOW,
++				.gpio.demod_reset.nr  = TBSECP3_GPIO_PIN(2, 0),
++			},
++			{
++				.ts_in = 3,
++				.i2c_bus_nr = 3,
++				.gpio.demod_reset.lvl = TBSECP3_GPIODEF_LOW,
++				.gpio.demod_reset.nr  = TBSECP3_GPIO_PIN(3, 0),
++			}
++		}
++	},
++	[TBSECP3_BOARD_TBS6290TD] = {
++		.board_id	= TBSECP3_BOARD_TBS6290TD,
++		.name		= "TurboSight TBS 6290SE DVB-T/T2/C + 2xCI ",
++		.i2c_speed	= 39,
++		.eeprom_i2c	= 1,
++		.adapters	= 2,
++		.adap_config	= {
++			{
++				.ts_in = 0,
++				.i2c_bus_nr = 0,
++				.gpio.demod_reset.lvl = TBSECP3_GPIODEF_LOW,
++				.gpio.demod_reset.nr  = TBSECP3_GPIO_PIN(0, 0),
++
++			}, 
++			{
++				.ts_in = 1,
++				.i2c_bus_nr = 1,
++				.gpio.demod_reset.lvl = TBSECP3_GPIODEF_LOW,
++				.gpio.demod_reset.nr  = TBSECP3_GPIO_PIN(1, 0),
++
++			},
++		}
++	},
++	[TBSECP3_BOARD_TBS7230] = {
++		.board_id	= TBSECP3_BOARD_TBS7230,
++		.name		= "Turbosight TBS 7230(Octa DVB-T/T2/C/C2/ISDB-T/C/ATSC)",
++		.i2c_speed  = 39,
++		.eeprom_i2c	= 0,
++		.eeprom_addr = 0x10,
++		.adapters	= 1,
++		.adap_config ={
++			{
++				.ts_in = 0,
++				.i2c_bus_nr = 0,
++				.gpio.demod_reset.lvl = TBSECP3_GPIODEF_LOW,
++				.gpio.demod_reset.nr  = TBSECP3_GPIO_PIN(0, 0),
++			}, 
++	
++		}
++	},
++	[TBSECP3_BOARD_TBS6209SE] = {
++		.board_id	= TBSECP3_BOARD_TBS6209SE,
++		.name		= "Turbosight TBS 6209SE(Octa DVB-T/T2/C/C2/ISDB-T/C/ATSC)",
++		.i2c_speed  = 39,
++		.eeprom_i2c	= 3,
++		.eeprom_addr = 0x10,
++		.adapters	= 8,
++		.adap_config ={
++			{
++				.ts_in = 0,
++				.i2c_bus_nr = 0,
++			}, 
++			{
++				.ts_in = 1,
++				.i2c_bus_nr = 0,
++			},
++			{
++				.ts_in = 2,
++				.i2c_bus_nr = 1,
++			},
++			{
++				.ts_in = 3,
++				.i2c_bus_nr = 1,
++			},
++			{
++				.ts_in = 4,
++				.i2c_bus_nr = 2,
++
++			},
++			{
++				.ts_in = 5,
++				.i2c_bus_nr = 2,
++			},
++			{
++				.ts_in = 6,
++				.i2c_bus_nr = 3,
++
++			},
++			{
++				.ts_in = 7,
++				.i2c_bus_nr = 3,
++			}
++
++		}
++	},
++	[TBSECP3_BOARD_TBS7901] = {
++		.board_id	= TBSECP3_BOARD_TBS7901,
++		.name		= "TurboSight TBS 7901 DVB-S/S2/S2x ",
++		.adapters	= 1,
++		.i2c_speed	= 39,
++		.eeprom_i2c	= 0,
++		.eeprom_addr = 0x10,
++		.adap_config	= {
++			{
++				.ts_in = 0,
++				.i2c_bus_nr = 0,
++				.gpio.demod_reset.lvl = TBSECP3_GPIODEF_LOW,
++				.gpio.demod_reset.nr  = TBSECP3_GPIO_PIN(0, 0),
++				.gpio.lnb_power.lvl   = TBSECP3_GPIODEF_LOW,
++				.gpio.lnb_power.nr    = TBSECP3_GPIO_PIN(0, 2),
++				.gpio.lnb_voltage.lvl = TBSECP3_GPIODEF_HIGH,
++				.gpio.lnb_voltage.nr  = TBSECP3_GPIO_PIN(0,1),				
++			}	
++			
++		}
++	},
++
++	[TBSECP3_BOARD_TBS6910SE] = {
++		.board_id	= TBSECP3_BOARD_TBS6910SE,
++		.name		= "TurboSight TBS 6910SE DVB-S/S2/S2x + 2xCI ",
++		.adapters	= 2,
++		.i2c_speed	= 39,
++		.eeprom_i2c	= 1,
++		.eeprom_addr = 0x10,
++		.adap_config	= {
++			{
++				.ts_in = 0,
++				.i2c_bus_nr = 0,
++				.gpio.demod_reset.lvl = TBSECP3_GPIODEF_LOW,
++				.gpio.demod_reset.nr  = TBSECP3_GPIO_PIN(0, 0),
++			},
++			{
++				.ts_in = 1,
++				.i2c_bus_nr = 1,
++				.gpio.demod_reset.lvl = TBSECP3_GPIODEF_LOW,
++				.gpio.demod_reset.nr  = TBSECP3_GPIO_PIN(1, 0),
++			},
++		}
++	},
++	[TBSECP3_BOARD_TBS6902SE] = {
++		.board_id	= TBSECP3_BOARD_TBS6902SE,
++		.name		= "TurboSight TBS 6902SE DVB-S/S2/S2x ",
++		.adapters	= 2,
++		.i2c_speed	= 39,
++		.eeprom_i2c	= 1,
++		.eeprom_addr = 0x10,
++		.adap_config	= {
++			{
++				.ts_in = 0,
++				.i2c_bus_nr = 0,
++				.gpio.demod_reset.lvl = TBSECP3_GPIODEF_LOW,
++				.gpio.demod_reset.nr  = TBSECP3_GPIO_PIN(0, 0),
++				.gpio.lnb_power.lvl   = TBSECP3_GPIODEF_LOW,
++				.gpio.lnb_power.nr    = TBSECP3_GPIO_PIN(0, 2),
++				.gpio.lnb_voltage.lvl = TBSECP3_GPIODEF_HIGH,
++				.gpio.lnb_voltage.nr  = TBSECP3_GPIO_PIN(0, 1),				
++			},	
++			{
++				.ts_in = 1,
++				.i2c_bus_nr = 1,
++				.gpio.demod_reset.lvl = TBSECP3_GPIODEF_LOW,
++				.gpio.demod_reset.nr  = TBSECP3_GPIO_PIN(1, 0),
++				.gpio.lnb_power.lvl   = TBSECP3_GPIODEF_LOW,
++				.gpio.lnb_power.nr    = TBSECP3_GPIO_PIN(1, 2),
++				.gpio.lnb_voltage.lvl = TBSECP3_GPIODEF_HIGH,
++				.gpio.lnb_voltage.nr  = TBSECP3_GPIO_PIN(1, 1),			
++			}
++			
++		}
++	},
++
++	[TBSECP3_BOARD_TBS6904SE] = {
++		.board_id	= TBSECP3_BOARD_TBS6904SE,
++		.name		= "TurboSight TBS 6904se DVB-S/S2/S2x ",
++		.adapters	= 4,
++		.i2c_speed	= 39,
++		.eeprom_i2c	= 3,
++		.adap_config	= {
++			{
++				.ts_in = 0,
++				.i2c_bus_nr = 0,
++				.gpio.demod_reset.lvl = TBSECP3_GPIODEF_LOW,
++				.gpio.demod_reset.nr  = TBSECP3_GPIO_PIN(0, 0),
++				.gpio.lnb_power.lvl   = TBSECP3_GPIODEF_LOW,
++				.gpio.lnb_power.nr    = TBSECP3_GPIO_PIN(0, 2),
++				.gpio.lnb_voltage.lvl = TBSECP3_GPIODEF_HIGH,
++				.gpio.lnb_voltage.nr  = TBSECP3_GPIO_PIN(0, 1),
++			},
++			{
++				.ts_in = 1,
++				.i2c_bus_nr = 1,
++				.gpio.demod_reset.lvl = TBSECP3_GPIODEF_LOW,
++				.gpio.demod_reset.nr  = TBSECP3_GPIO_PIN(1, 0),
++				.gpio.lnb_power.lvl   = TBSECP3_GPIODEF_LOW,
++				.gpio.lnb_power.nr    = TBSECP3_GPIO_PIN(1, 2),
++				.gpio.lnb_voltage.lvl = TBSECP3_GPIODEF_HIGH,
++				.gpio.lnb_voltage.nr  = TBSECP3_GPIO_PIN(1, 1),				
++			},
++			{
++				.ts_in = 2,
++				.i2c_bus_nr = 2,
++				.gpio.demod_reset.lvl = TBSECP3_GPIODEF_LOW,
++				.gpio.demod_reset.nr  = TBSECP3_GPIO_PIN(2, 0),
++				.gpio.lnb_power.lvl   = TBSECP3_GPIODEF_LOW,
++				.gpio.lnb_power.nr    = TBSECP3_GPIO_PIN(2, 2),
++				.gpio.lnb_voltage.lvl = TBSECP3_GPIODEF_HIGH,
++				.gpio.lnb_voltage.nr  = TBSECP3_GPIO_PIN(2, 1),	
++			},
++			{
++				.ts_in = 3,
++				.i2c_bus_nr = 3,
++				.gpio.demod_reset.lvl = TBSECP3_GPIODEF_LOW,
++				.gpio.demod_reset.nr  = TBSECP3_GPIO_PIN(3, 0),
++				.gpio.lnb_power.lvl   = TBSECP3_GPIODEF_LOW,
++				.gpio.lnb_power.nr    = TBSECP3_GPIO_PIN(3, 2),
++				.gpio.lnb_voltage.lvl = TBSECP3_GPIODEF_HIGH,
++				.gpio.lnb_voltage.nr  = TBSECP3_GPIO_PIN(3, 1),			
++			}, 
++		}
++	},
++	[TBSECP3_BOARD_TBS6508] = {
++		.board_id	= TBSECP3_BOARD_TBS6508,
++		.name		= "TurboSight TBS 6508 DVB-S/S2/S2X/T/T2/C(QAM-A/B/C)/C2/ISDB-T ",
++		.adapters	= 8,
++		.i2c_speed	= 39,
++		.eeprom_i2c	= 3,
++		.eeprom_addr = 0x10,
++		.adap_config	= {
++			{
++				.ts_in = 4,
++				.i2c_bus_nr = 2,
++				.gpio.demod_reset.lvl = TBSECP3_GPIODEF_LOW,
++				.gpio.demod_reset.nr  = TBSECP3_GPIO_PIN(2, 0),
++				.gpio.lnb_power.lvl   = TBSECP3_GPIODEF_LOW,
++				.gpio.lnb_power.nr    = TBSECP3_GPIO_PIN(2, 2),
++				.gpio.lnb_voltage.lvl = TBSECP3_GPIODEF_HIGH,
++				.gpio.lnb_voltage.nr  = TBSECP3_GPIO_PIN(2, 1),
++			},
++			{
++				.ts_in = 5,
++				.i2c_bus_nr = 2,
++				.gpio.lnb_power.lvl   = TBSECP3_GPIODEF_LOW,
++				.gpio.lnb_power.nr    = TBSECP3_GPIO_PIN(2, 2),
++				.gpio.lnb_voltage.lvl = TBSECP3_GPIODEF_HIGH,
++				.gpio.lnb_voltage.nr  = TBSECP3_GPIO_PIN(2, 1),
++			},
++			{
++				.ts_in = 0,
++				.i2c_bus_nr = 0,
++				.gpio.demod_reset.lvl = TBSECP3_GPIODEF_LOW,
++				.gpio.demod_reset.nr  = TBSECP3_GPIO_PIN(0, 0),
++				.gpio.lnb_power.lvl   = TBSECP3_GPIODEF_LOW,
++				.gpio.lnb_power.nr	  = TBSECP3_GPIO_PIN(0, 2),
++				.gpio.lnb_voltage.lvl = TBSECP3_GPIODEF_HIGH,
++				.gpio.lnb_voltage.nr  = TBSECP3_GPIO_PIN(0, 1),
++			},
++			{
++				.ts_in = 1,
++				.i2c_bus_nr = 0,
++				.gpio.lnb_power.lvl   = TBSECP3_GPIODEF_LOW,
++				.gpio.lnb_power.nr	  = TBSECP3_GPIO_PIN(0, 2),
++				.gpio.lnb_voltage.lvl = TBSECP3_GPIODEF_HIGH,
++				.gpio.lnb_voltage.nr  = TBSECP3_GPIO_PIN(0, 1),
++			},
++			{
++				.ts_in = 2,
++				.i2c_bus_nr = 1,
++				.gpio.demod_reset.lvl = TBSECP3_GPIODEF_LOW,
++				.gpio.demod_reset.nr  = TBSECP3_GPIO_PIN(1, 0),
++				.gpio.lnb_power.lvl   = TBSECP3_GPIODEF_LOW,
++				.gpio.lnb_power.nr    = TBSECP3_GPIO_PIN(1, 2),
++				.gpio.lnb_voltage.lvl = TBSECP3_GPIODEF_HIGH,
++				.gpio.lnb_voltage.nr  = TBSECP3_GPIO_PIN(1, 1),
++			},
++			{
++				.ts_in = 3,
++				.i2c_bus_nr = 1,
++				.gpio.lnb_power.lvl   = TBSECP3_GPIODEF_LOW,
++				.gpio.lnb_power.nr    = TBSECP3_GPIO_PIN(1, 2),
++				.gpio.lnb_voltage.lvl = TBSECP3_GPIODEF_HIGH,
++				.gpio.lnb_voltage.nr  = TBSECP3_GPIO_PIN(1, 1),
++			},
++			{
++				.ts_in = 6,
++				.i2c_bus_nr = 3,
++				.gpio.demod_reset.lvl = TBSECP3_GPIODEF_LOW,
++				.gpio.demod_reset.nr  = TBSECP3_GPIO_PIN(3, 0),
++				.gpio.lnb_power.lvl   = TBSECP3_GPIODEF_LOW,
++				.gpio.lnb_power.nr	  = TBSECP3_GPIO_PIN(3, 2),
++				.gpio.lnb_voltage.lvl = TBSECP3_GPIODEF_HIGH,
++				.gpio.lnb_voltage.nr  = TBSECP3_GPIO_PIN(3, 1),
++			},
++			{
++				.ts_in = 7,
++				.i2c_bus_nr = 3,
++				.gpio.lnb_power.lvl   = TBSECP3_GPIODEF_LOW,
++				.gpio.lnb_power.nr	  = TBSECP3_GPIO_PIN(3, 2),
++				.gpio.lnb_voltage.lvl = TBSECP3_GPIODEF_HIGH,
++				.gpio.lnb_voltage.nr  = TBSECP3_GPIO_PIN(3, 1),
++			},
++		}
++	},
++
++	[TBSECP3_BOARD_TBS6504] = {
++		.board_id	= TBSECP3_BOARD_TBS6504,
++		.name		= "TurboSight TBS 6504 DVB-S/S2/S2X/T/T2/C/C2/ISDB-T ",
++		.adapters	= 4,
++		.i2c_speed	= 39,
++		.eeprom_i2c	= 0,
++		.adap_config	= {
++			{
++				.ts_in = 3,
++				.i2c_bus_nr = 1,
++				.gpio.demod_reset.lvl = TBSECP3_GPIODEF_LOW,
++				.gpio.demod_reset.nr  = TBSECP3_GPIO_PIN(1, 0),
++				.gpio.lnb_power.lvl   = TBSECP3_GPIODEF_LOW,
++				.gpio.lnb_power.nr    = TBSECP3_GPIO_PIN(3, 2),
++				.gpio.lnb_voltage.lvl = TBSECP3_GPIODEF_HIGH,
++				.gpio.lnb_voltage.nr  = TBSECP3_GPIO_PIN(3, 1),
++			},
++			{
++				.ts_in = 2,
++				.i2c_bus_nr = 1,
++				.gpio.lnb_power.lvl   = TBSECP3_GPIODEF_LOW,
++				.gpio.lnb_power.nr    = TBSECP3_GPIO_PIN(2, 2),
++				.gpio.lnb_voltage.lvl = TBSECP3_GPIODEF_HIGH,
++				.gpio.lnb_voltage.nr  = TBSECP3_GPIO_PIN(2, 1),
++			},
++			{
++					.ts_in = 1,
++					.i2c_bus_nr = 0,
++					.gpio.demod_reset.lvl = TBSECP3_GPIODEF_LOW,
++					.gpio.demod_reset.nr  = TBSECP3_GPIO_PIN(0, 0),
++					.gpio.lnb_power.lvl   = TBSECP3_GPIODEF_LOW,
++					.gpio.lnb_power.nr	  = TBSECP3_GPIO_PIN(1, 2),
++					.gpio.lnb_voltage.lvl = TBSECP3_GPIODEF_HIGH,
++					.gpio.lnb_voltage.nr  = TBSECP3_GPIO_PIN(1, 1),
++				},
++				{
++					.ts_in = 0,
++					.i2c_bus_nr = 0,
++					.gpio.lnb_power.lvl   = TBSECP3_GPIODEF_LOW,
++					.gpio.lnb_power.nr	  = TBSECP3_GPIO_PIN(0, 2),
++					.gpio.lnb_voltage.lvl = TBSECP3_GPIODEF_HIGH,
++					.gpio.lnb_voltage.nr  = TBSECP3_GPIO_PIN(0, 1),
++				},
++		}
++	},
++
++	[TBSECP3_BOARD_TBS6904X] = {
++		.board_id	= TBSECP3_BOARD_TBS6904X,
++		.name		= "TurboSight TBS 6904x DVB-S/S2/S2X ",
++		.adapters	= 4,
++		.i2c_speed	= 39,
++		.eeprom_i2c	= 0,
++		.eeprom_addr = 0x10,
++		.adap_config	= {
++			{
++				.ts_in = 3,
++				.i2c_bus_nr = 1,
++				.gpio.demod_reset.lvl = TBSECP3_GPIODEF_LOW,
++				.gpio.demod_reset.nr  = TBSECP3_GPIO_PIN(1, 0),
++				.gpio.lnb_power.lvl   = TBSECP3_GPIODEF_LOW,
++				.gpio.lnb_power.nr    = TBSECP3_GPIO_PIN(3, 2),
++				.gpio.lnb_voltage.lvl = TBSECP3_GPIODEF_HIGH,
++				.gpio.lnb_voltage.nr  = TBSECP3_GPIO_PIN(3, 1),
++			},
++			{
++				.ts_in = 2,
++				.i2c_bus_nr = 1,
++				.gpio.lnb_power.lvl   = TBSECP3_GPIODEF_LOW,
++				.gpio.lnb_power.nr    = TBSECP3_GPIO_PIN(2, 2),
++				.gpio.lnb_voltage.lvl = TBSECP3_GPIODEF_HIGH,
++				.gpio.lnb_voltage.nr  = TBSECP3_GPIO_PIN(2, 1),
++			},
++			{
++				.ts_in = 1,
++				.i2c_bus_nr = 0,
++				.gpio.demod_reset.lvl = TBSECP3_GPIODEF_LOW,
++				.gpio.demod_reset.nr  = TBSECP3_GPIO_PIN(0, 0),
++				.gpio.lnb_power.lvl   = TBSECP3_GPIODEF_LOW,
++				.gpio.lnb_power.nr	  = TBSECP3_GPIO_PIN(1, 2),
++				.gpio.lnb_voltage.lvl = TBSECP3_GPIODEF_HIGH,
++				.gpio.lnb_voltage.nr  = TBSECP3_GPIO_PIN(1, 1),
++			},
++			{
++				.ts_in = 0,
++				.i2c_bus_nr = 0,
++				.gpio.lnb_power.lvl   = TBSECP3_GPIODEF_LOW,
++				.gpio.lnb_power.nr	  = TBSECP3_GPIO_PIN(0, 2),
++				.gpio.lnb_voltage.lvl = TBSECP3_GPIODEF_HIGH,
++				.gpio.lnb_voltage.nr  = TBSECP3_GPIO_PIN(0, 1),
++			},
++
++		}
++	},
++    // added by lucy on 06012020
++	[TBSECP3_BOARD_TBS6302SE] = {
++		.board_id	= TBSECP3_BOARD_TBS6302SE,
++ 	 	.name		= "TurboSight TBS 6302se HDMI Capture ",
++		.adapters	= 2,
++		.i2c_speed	= 39,
++		.eeprom_i2c	= 0,
++		.adap_config	= {
++ 			{ 
++ 			 	.ts_in = 1,
++				.i2c_bus_nr = 2,
++			}, 
++ 			{ 
++ 			 	.ts_in = 3,
++				.i2c_bus_nr = 0,
++			}, 
++			
++		}
++	},
++	[TBSECP3_BOARD_TBS6308] = {
++		.board_id	= TBSECP3_BOARD_TBS6308,
++		.name		= "TurboSight TBS 6304 HDMI Capture",
++		.adapters	= 4,
++		.i2c_speed	= 39,
++		.eeprom_i2c	= 0,
++		.adap_config	= {
++			{
++				.ts_in = 0,
++				.i2c_bus_nr = 0,
++			}, 
++			{
++				.ts_in = 1,
++				.i2c_bus_nr = 0,
++			},
++			{
++				.ts_in = 2,
++				.i2c_bus_nr = 0,
++			},
++			{
++				.ts_in = 3,
++				.i2c_bus_nr = 0,
++			},
++			{
++				.ts_in = 4,
++				.i2c_bus_nr = 0,
++			},
++			{
++				.ts_in = 5,
++				.i2c_bus_nr = 0,
++			},
++			{
++				.ts_in = 6,
++				.i2c_bus_nr = 0,
++			},
++			{
++				.ts_in = 7,
++				.i2c_bus_nr = 0,
++
++			}
++		}
++	},
++	[TBSECP3_BOARD_TBS6308X] = {
++			.board_id	= TBSECP3_BOARD_TBS6308X,
++			.name		= "TurboSight TBS 6308X HDMI Capture",
++			.adapters	= 8,
++			.i2c_speed	= 39,
++			.eeprom_i2c	= 1,
++			.eeprom_addr	= 0x10,
++			.adap_config	= {
++				{
++					.ts_in = 0,
++					.i2c_bus_nr = 0,
++				}, 
++				{
++					.ts_in = 1,
++					.i2c_bus_nr = 0,
++				},
++				{
++					.ts_in = 2,
++					.i2c_bus_nr = 0,
++				},
++				{
++					.ts_in = 3,
++					.i2c_bus_nr = 0,
++				},
++				{
++					.ts_in = 4,
++					.i2c_bus_nr = 0,
++				},
++				{
++					.ts_in = 5,
++					.i2c_bus_nr = 0,
++				},
++				{
++					.ts_in = 6,
++					.i2c_bus_nr = 0,
++				},
++				{
++					.ts_in = 7,
++					.i2c_bus_nr = 0,
++
++				}
++			}
++		},
++	[TBSECP3_BOARD_TBS6312X] = {
++			.board_id	= TBSECP3_BOARD_TBS6312X,
++			.name		= "TurboSight TBS 6312X HDMI Capture",
++			.adapters	= 12,
++			.i2c_speed	= 39,
++			.eeprom_i2c	= 1,
++			.eeprom_addr	= 0x10,
++			.adap_config	= {
++				{
++					.ts_in = 0,
++					.i2c_bus_nr = 0,
++				}, 
++				{
++					.ts_in = 1,
++					.i2c_bus_nr = 0,
++				},
++				{
++					.ts_in = 2,
++					.i2c_bus_nr = 0,
++				},
++				{
++					.ts_in = 3,
++					.i2c_bus_nr = 0,
++				},
++				{
++					.ts_in = 4,
++					.i2c_bus_nr = 0,
++				},
++				{
++					.ts_in = 5,
++					.i2c_bus_nr = 0,
++				},
++				{
++					.ts_in = 6,
++					.i2c_bus_nr = 0,
++				},
++				{
++					.ts_in = 7,
++					.i2c_bus_nr = 0,
++
++				},
++				{
++					.ts_in = 8,
++					.i2c_bus_nr = 0,
++
++				},
++				{
++					.ts_in = 9,
++					.i2c_bus_nr = 0,
++
++				},
++				{
++					.ts_in = 10,
++					.i2c_bus_nr = 0,
++
++				},
++				{
++					.ts_in = 11,
++					.i2c_bus_nr = 0,
++
++				}
++			}
++		},
++    // added by pzw in 2017,12,12
++	[TBSECP3_BOARD_TBS6304] = {
++		.board_id	= TBSECP3_BOARD_TBS6304,
++ 	 	.name		= "TurboSight TBS 6304 HDMI Capture ",
++		.adapters	= 4,
++		.i2c_speed	= 39,
++		.eeprom_i2c	= 0,
++		.adap_config	= {
++ 			{ 
++ 			 	.ts_in = 0,
++				.i2c_bus_nr = 3,
++				.gpio.demod_reset.lvl = TBSECP3_GPIODEF_LOW,
++				.gpio.demod_reset.nr  = TBSECP3_GPIO_PIN(3, 0),
++				.gpio.lnb_power.lvl   = TBSECP3_GPIODEF_LOW,
++				.gpio.lnb_power.nr    = TBSECP3_GPIO_PIN(3, 2),
++			}, 
++ 			{ 
++ 			 	.ts_in = 1,
++				.i2c_bus_nr = 2,
++				.gpio.demod_reset.lvl = TBSECP3_GPIODEF_LOW,
++				.gpio.demod_reset.nr  = TBSECP3_GPIO_PIN(2, 0),
++				.gpio.lnb_power.lvl   = TBSECP3_GPIODEF_LOW,
++				.gpio.lnb_power.nr    = TBSECP3_GPIO_PIN(2, 2),
++			}, 
++ 			{ 
++ 			 	.ts_in = 2,
++				.i2c_bus_nr = 1,
++				.gpio.demod_reset.lvl = TBSECP3_GPIODEF_LOW,
++				.gpio.demod_reset.nr  = TBSECP3_GPIO_PIN(1, 0),
++				.gpio.lnb_power.lvl   = TBSECP3_GPIODEF_LOW,
++				.gpio.lnb_power.nr    = TBSECP3_GPIO_PIN(1, 2),
++			}, 
++ 			{ 
++ 			 	.ts_in = 3,
++				.i2c_bus_nr = 0,
++				.gpio.demod_reset.lvl = TBSECP3_GPIODEF_LOW,
++				.gpio.demod_reset.nr  = TBSECP3_GPIO_PIN(0, 0),
++				.gpio.lnb_power.lvl   = TBSECP3_GPIODEF_LOW,
++				.gpio.lnb_power.nr    = TBSECP3_GPIO_PIN(0, 2),
++			}, 
++			
++		}
++	},
++	[TBSECP3_BOARD_TBS6301] = {
++		.board_id	= TBSECP3_BOARD_TBS6301,
++		.name		= "TurboSight TBS 6301 HDMI Capture ",
++		.adapters	= 1,
++		.i2c_speed	= 39,
++		.eeprom_i2c	= 0,
++		.adap_config	= {
++			{
++				.ts_in = 0,
++				.i2c_bus_nr = 3,
++				.gpio.demod_reset.lvl = TBSECP3_GPIODEF_LOW,
++				.gpio.demod_reset.nr  = TBSECP3_GPIO_PIN(3, 0),
++				.gpio.lnb_power.lvl   = TBSECP3_GPIODEF_LOW,
++				.gpio.lnb_power.nr    = TBSECP3_GPIO_PIN(3, 2),
++			},
++			
++		}
++	},
++	[TBSECP3_BOARD_TBS6301SE] = {
++		.board_id	= TBSECP3_BOARD_TBS6301SE,
++		.name		= "TurboSight TBS 6301T HDMI Capture ",
++		.adapters	= 1,
++		.i2c_speed	= 39,
++		.eeprom_i2c	= 1,
++		.adap_config	= {
++			{
++				.ts_in = 0,
++				.i2c_bus_nr = 3,
++				.gpio.demod_reset.lvl = TBSECP3_GPIODEF_LOW,
++				.gpio.demod_reset.nr  = TBSECP3_GPIO_PIN(3, 0),
++				.gpio.lnb_power.lvl   = TBSECP3_GPIODEF_LOW,
++				.gpio.lnb_power.nr    = TBSECP3_GPIO_PIN(3, 2),
++			},
++			
++		}
++	},
++	[TBSECP3_BOARD_TBS6302X] = {
++		.board_id	= TBSECP3_BOARD_TBS6302X,
++		.name		= "TurboSight TBS 6302X HDMI Capture ",
++		.adapters	= 2,
++		.i2c_speed	= 39,
++		.eeprom_i2c	= 1,
++		.adap_config	= {
++			{
++				.ts_in = 0,
++				.i2c_bus_nr = 3,
++			},
++			{
++				.ts_in = 1,
++				.i2c_bus_nr = 2,
++			},
++		}
++	},
++	[TBSECP3_BOARD_TBS6302T] = {
++		.board_id	= TBSECP3_BOARD_TBS6302T,
++		.name		= "TurboSight TBS 6302T HDMI Capture ",
++		.adapters	= 2,
++		.i2c_speed	= 39,
++		.eeprom_i2c	= 1,
++		.adap_config	= {
++			{
++				.ts_in = 0,
++				.i2c_bus_nr = 3,
++			},
++			{
++				.ts_in = 1,
++				.i2c_bus_nr = 2,
++			},
++		}
++	},
++	[TBSECP3_BOARD_TBS6304X] = {
++		.board_id	= TBSECP3_BOARD_TBS6304X,
++		.name		= "TurboSight TBS 6304X HDMI Capture ",
++		.adapters	= 4,
++		.i2c_speed	= 39,
++		.eeprom_i2c	= 1,
++		.adap_config	= {
++			{
++				.ts_in = 0,
++				.i2c_bus_nr = 3,
++			},
++			{
++				.ts_in = 1,
++				.i2c_bus_nr = 2,
++			},
++			{
++				.ts_in = 2,
++				.i2c_bus_nr = 1,
++			},
++			{
++				.ts_in = 3,
++				.i2c_bus_nr = 0,
++			},
++		}
++	},
++	[TBSECP3_BOARD_TBS6304T] = {
++		.board_id	= TBSECP3_BOARD_TBS6304T,
++		.name		= "TurboSight TBS 6304T HDMI Capture ",
++		.adapters	= 4,
++		.i2c_speed	= 39,
++		.eeprom_i2c	= 1,
++		.adap_config	= {
++			{
++				.ts_in = 0,
++				.i2c_bus_nr = 3,
++			},
++			{
++				.ts_in = 1,
++				.i2c_bus_nr = 2,
++			},
++			{
++				.ts_in = 2,
++				.i2c_bus_nr = 1,
++			},
++			{
++				.ts_in = 3,
++				.i2c_bus_nr = 0,
++			},
++		}
++	},
++	[TBSECP3_BOARD_TBS690a] = {
++		.board_id	= TBSECP3_BOARD_TBS690a,
++		.name		= "TurboSight TBS 690a ASI Capture ",
++		.adapters	= 4,
++		.i2c_speed	= 39,
++		.eeprom_i2c	= 1,
++		.adap_config	= {
++			{
++				.ts_in = 0,
++				.i2c_bus_nr = 3,
++				.gpio.demod_reset.lvl = TBSECP3_GPIODEF_LOW,
++				.gpio.demod_reset.nr  = TBSECP3_GPIO_PIN(3, 0),
++				.gpio.lnb_power.lvl   = TBSECP3_GPIODEF_LOW,
++				.gpio.lnb_power.nr    = TBSECP3_GPIO_PIN(3, 2),
++			},
++			{
++				.ts_in = 1,
++				.i2c_bus_nr = 2,
++				.gpio.demod_reset.lvl = TBSECP3_GPIODEF_LOW,
++				.gpio.demod_reset.nr  = TBSECP3_GPIO_PIN(2, 0),
++				.gpio.lnb_power.lvl   = TBSECP3_GPIODEF_LOW,
++				.gpio.lnb_power.nr    = TBSECP3_GPIO_PIN(2, 2),
++			},
++			{
++				.ts_in = 2,
++				.i2c_bus_nr = 1,
++				.gpio.demod_reset.lvl = TBSECP3_GPIODEF_LOW,
++				.gpio.demod_reset.nr  = TBSECP3_GPIO_PIN(1, 0),
++				.gpio.lnb_power.lvl   = TBSECP3_GPIODEF_LOW,
++				.gpio.lnb_power.nr    = TBSECP3_GPIO_PIN(1, 2),
++			},
++			{
++				.ts_in = 3,
++				.i2c_bus_nr = 0,
++				.gpio.demod_reset.lvl = TBSECP3_GPIODEF_LOW,
++				.gpio.demod_reset.nr  = TBSECP3_GPIO_PIN(0, 0),
++				.gpio.lnb_power.lvl   = TBSECP3_GPIODEF_LOW,
++				.gpio.lnb_power.nr    = TBSECP3_GPIO_PIN(0, 2),
++			}, 
++		}
++	},
++	[TBSECP3_BOARD_TBS6514] = {
++		.board_id	= TBSECP3_BOARD_TBS6514,
++		.name  		= "Turbosight TBS 6514 (Quad DTMB)",
++		.i2c_speed  = 39,
++		.eeprom_i2c = 1,
++		.adapters	= 4,
++		.adap_config ={
++			
++			{
++				.ts_in = 0,
++				.i2c_bus_nr = 0,
++				.gpio.demod_reset.lvl = TBSECP3_GPIODEF_LOW,
++				.gpio.demod_reset.nr  = TBSECP3_GPIO_PIN(0, 0),
++			}, 
++			{
++				.ts_in = 1,
++				.i2c_bus_nr = 1,
++				.gpio.demod_reset.lvl = TBSECP3_GPIODEF_LOW,
++				.gpio.demod_reset.nr  = TBSECP3_GPIO_PIN(1, 0),
++			},
++			{
++				.ts_in = 2,
++				.i2c_bus_nr = 2,
++				.gpio.demod_reset.lvl = TBSECP3_GPIODEF_LOW,
++				.gpio.demod_reset.nr  = TBSECP3_GPIO_PIN(2, 0),
++			},
++			{
++				.ts_in = 3,
++				.i2c_bus_nr = 3,
++				.gpio.demod_reset.lvl = TBSECP3_GPIODEF_LOW,
++				.gpio.demod_reset.nr  = TBSECP3_GPIO_PIN(3, 0),
++			}
++		},
++	},
++
++	[TBSECP3_BOARD_TBS6814] = {
++		.board_id	= TBSECP3_BOARD_TBS6814,
++		.name  		= "Turbosight TBS 6814 (Quad ISDB-T)",
++		.i2c_speed  = 39,
++		.eeprom_i2c = 1,
++		.adapters	= 4,
++		.adap_config ={
++			
++			{
++				.ts_in = 0,
++				.i2c_bus_nr = 0,
++				.gpio.demod_reset.lvl = TBSECP3_GPIODEF_LOW,
++				.gpio.demod_reset.nr  = TBSECP3_GPIO_PIN(0, 0),
++			}, 
++			{
++				.ts_in = 1,
++				.i2c_bus_nr = 1,
++				.gpio.demod_reset.lvl = TBSECP3_GPIODEF_LOW,
++				.gpio.demod_reset.nr  = TBSECP3_GPIO_PIN(1, 0),
++			},
++			{
++				.ts_in = 2,
++				.i2c_bus_nr = 2,
++				.gpio.demod_reset.lvl = TBSECP3_GPIODEF_LOW,
++				.gpio.demod_reset.nr  = TBSECP3_GPIO_PIN(2, 0),
++			},
++			{
++				.ts_in = 3,
++				.i2c_bus_nr = 3,
++				.gpio.demod_reset.lvl = TBSECP3_GPIODEF_LOW,
++				.gpio.demod_reset.nr  = TBSECP3_GPIO_PIN(3, 0),
++			}
++		},
++	},
++	[TBSECP3_BOARD_TBS6209] = {
++		.board_id	= TBSECP3_BOARD_TBS6209,
++		.name		= "Turbosight TBS 6209 (Octa DVB-T/T2/C/C2/ISDB-T)",
++		.i2c_speed  = 39,
++		.eeprom_i2c	= 0,
++		.eeprom_addr = 0x10,
++		.adapters	= 8,
++		.adap_config ={
++			{
++				.ts_in = 0,
++				.i2c_bus_nr = 0,
++				.gpio.demod_reset.lvl = TBSECP3_GPIODEF_LOW,
++				.gpio.demod_reset.nr  = TBSECP3_GPIO_PIN(0, 0),
++			}, 
++			{
++				.ts_in = 1,
++				.i2c_bus_nr = 0,
++			},
++			{
++				.ts_in = 2,
++				.i2c_bus_nr = 1,
++				.gpio.demod_reset.lvl = TBSECP3_GPIODEF_LOW,
++				.gpio.demod_reset.nr  = TBSECP3_GPIO_PIN(1, 0),
++			},
++			{
++				.ts_in = 3,
++				.i2c_bus_nr = 1,
++			},
++			{
++				.ts_in = 4,
++				.i2c_bus_nr = 2,
++				.gpio.demod_reset.lvl = TBSECP3_GPIODEF_LOW,
++				.gpio.demod_reset.nr  = TBSECP3_GPIO_PIN(2, 0),
++				
++			},
++			{
++				.ts_in = 5,
++				.i2c_bus_nr = 2,
++			},
++			{
++				.ts_in = 6,
++				.i2c_bus_nr = 3,
++				.gpio.demod_reset.lvl = TBSECP3_GPIODEF_LOW,
++				.gpio.demod_reset.nr  = TBSECP3_GPIO_PIN(3, 0),
++				
++			},
++			{
++				.ts_in = 7,
++				.i2c_bus_nr = 3,
++			}
++		
++		}
++	},
++	[TBSECP3_BOARD_TBS6704] = {
++		.board_id	= TBSECP3_BOARD_TBS6704,
++		.name		= "TurboSight TBS 6704(Quad ATSC/QAMB)",
++		.i2c_speed	= 39,
++		.eeprom_i2c	= 1,
++		.adapters	= 4,
++		.adap_config	= {
++			{
++				.ts_in = 0,
++				.i2c_bus_nr = 0,
++				.gpio.demod_reset.lvl = TBSECP3_GPIODEF_LOW,
++				.gpio.demod_reset.nr  = TBSECP3_GPIO_PIN(0, 0),
++			}, 
++			{
++				.ts_in = 1,
++				.i2c_bus_nr = 1,
++				.gpio.demod_reset.lvl = TBSECP3_GPIODEF_LOW,
++				.gpio.demod_reset.nr  = TBSECP3_GPIO_PIN(1, 0),
++			},
++			{
++				.ts_in = 2,
++				.i2c_bus_nr = 2,
++				.gpio.demod_reset.lvl = TBSECP3_GPIODEF_LOW,
++				.gpio.demod_reset.nr  = TBSECP3_GPIO_PIN(2, 0),
++			},
++			{
++				.ts_in = 3,
++				.i2c_bus_nr = 3,
++				.gpio.demod_reset.lvl = TBSECP3_GPIODEF_LOW,
++				.gpio.demod_reset.nr  = TBSECP3_GPIO_PIN(3, 0),
++			}
++		}
++	},
++
++	[TBSECP3_BOARD_TBS6205] = {
++		.board_id	= TBSECP3_BOARD_TBS6205,
++		.name		= "TurboSight TBS 6205 DVB-T/T2/C ",
++		.i2c_speed	= 39,
++		.eeprom_i2c	= 1,
++		.eeprom_addr = 0xa0,
++		.adapters	= 4,
++		.adap_config	= {
++			{
++				.ts_in = 0,
++				.i2c_bus_nr = 0,
++				.gpio.demod_reset.lvl = TBSECP3_GPIODEF_LOW,
++				.gpio.demod_reset.nr  = TBSECP3_GPIO_PIN(0, 0),
++			}, 
++			{
++				.ts_in = 1,
++				.i2c_bus_nr = 1,
++				.gpio.demod_reset.lvl = TBSECP3_GPIODEF_LOW,
++				.gpio.demod_reset.nr  = TBSECP3_GPIO_PIN(1, 0),
++			},
++			{
++				.ts_in = 2,
++				.i2c_bus_nr = 2,
++				.gpio.demod_reset.lvl = TBSECP3_GPIODEF_LOW,
++				.gpio.demod_reset.nr  = TBSECP3_GPIO_PIN(2, 0),
++			},
++			{
++				.ts_in = 3,
++				.i2c_bus_nr = 3,
++				.gpio.demod_reset.lvl = TBSECP3_GPIODEF_LOW,
++				.gpio.demod_reset.nr  = TBSECP3_GPIO_PIN(3, 0),
++			}
++		}
++	},
++	[TBSECP3_BOARD_TBS6522] = {
++		.board_id	= TBSECP3_BOARD_TBS6522,
++		.name		= "TurboSight TBS 6522 DVB-S/S2/S2X/T/T2/C/C2/ISDB-T ",
++		.adapters	= 2,
++		.i2c_speed	= 39,
++		.eeprom_i2c	= 0,
++		.eeprom_addr = 0xa0,
++		.adap_config	= {
++			{
++				.ts_in = 1,
++				.i2c_bus_nr = 0,
++				.gpio.demod_reset.lvl = TBSECP3_GPIODEF_LOW,
++				.gpio.demod_reset.nr  = TBSECP3_GPIO_PIN(0, 0),
++				.gpio.lnb_power.lvl   = TBSECP3_GPIODEF_LOW,
++				.gpio.lnb_power.nr    = TBSECP3_GPIO_PIN(0, 2),
++				.gpio.lnb_voltage.lvl = TBSECP3_GPIODEF_HIGH,
++				.gpio.lnb_voltage.nr  = TBSECP3_GPIO_PIN(0, 1),
++			},
++			{
++				.ts_in = 0,
++				.i2c_bus_nr = 0,
++				.gpio.lnb_power.lvl   = TBSECP3_GPIODEF_LOW,
++				.gpio.lnb_power.nr    = TBSECP3_GPIO_PIN(1, 2),
++				.gpio.lnb_voltage.lvl = TBSECP3_GPIODEF_HIGH,
++				.gpio.lnb_voltage.nr  = TBSECP3_GPIO_PIN(1, 1),
++			},
++		}
++	},
++	[TBSECP3_BOARD_TBS6902] = {
++		.board_id	= TBSECP3_BOARD_TBS6902,
++		.name		= "TurboSight TBS 6902 DVB-S/S2 ",
++		.adapters	= 2,
++		.i2c_speed	= 39,
++		.eeprom_i2c	= 0,
++		.adap_config	= {
++			{
++				.ts_in = 1,
++				.i2c_bus_nr = 1,
++				.gpio.demod_reset.lvl = TBSECP3_GPIODEF_LOW,
++				.gpio.demod_reset.nr  = TBSECP3_GPIO_PIN(1, 0),
++				.gpio.lnb_power.lvl   = TBSECP3_GPIODEF_LOW,
++				.gpio.lnb_power.nr    = TBSECP3_GPIO_PIN(1, 2),
++			},	
++			{
++				.ts_in = 0,
++				.i2c_bus_nr = 0,
++				.gpio.demod_reset.lvl = TBSECP3_GPIODEF_LOW,
++				.gpio.demod_reset.nr  = TBSECP3_GPIO_PIN(0, 0),
++				.gpio.lnb_power.lvl   = TBSECP3_GPIODEF_LOW,
++				.gpio.lnb_power.nr    = TBSECP3_GPIO_PIN(0, 2),
++			}
++			
++		}
++	},
++	[TBSECP3_BOARD_TBS6903] = {
++		.board_id	= TBSECP3_BOARD_TBS6903,
++		.name		= "TurboSight TBS 6903 DVB-S/S2 ",
++		.adapters	= 2,
++		.i2c_speed	= 39,
++		.eeprom_i2c	= 1,
++		.adap_config	= {
++			{
++				.ts_in = 0,
++				.i2c_bus_nr = 0,
++				.gpio.demod_reset.lvl = TBSECP3_GPIODEF_LOW,
++				.gpio.demod_reset.nr  = TBSECP3_GPIO_PIN(0, 0),
++				.gpio.lnb_power.lvl   = TBSECP3_GPIODEF_LOW,
++				.gpio.lnb_power.nr    = TBSECP3_GPIO_PIN(0, 2),
++				.gpio.lnb_voltage.lvl = TBSECP3_GPIODEF_HIGH,
++				.gpio.lnb_voltage.nr  = TBSECP3_GPIO_PIN(0, 1),
++			}, 
++			{
++				.ts_in = 1,
++				.i2c_bus_nr = 0,
++				.gpio.lnb_power.lvl   = TBSECP3_GPIODEF_LOW,
++				.gpio.lnb_power.nr    = TBSECP3_GPIO_PIN(1, 2),
++				.gpio.lnb_voltage.lvl = TBSECP3_GPIODEF_HIGH,
++				.gpio.lnb_voltage.nr  = TBSECP3_GPIO_PIN(1, 1),
++			},
++		}
++	},
++	[TBSECP3_BOARD_TBS6904] = {
++		.board_id	= TBSECP3_BOARD_TBS6904,
++		.name		= "TurboSight TBS 6904 DVB-S/S2 ",
++		.adapters	= 4,
++		.i2c_speed	= 39,
++		.eeprom_i2c	= 1,
++		.adap_config	= {
++			{
++				.ts_in = 3,
++				.i2c_bus_nr = 3,
++				.gpio.demod_reset.lvl = TBSECP3_GPIODEF_LOW,
++				.gpio.demod_reset.nr  = TBSECP3_GPIO_PIN(3, 0),
++				.gpio.lnb_power.lvl   = TBSECP3_GPIODEF_LOW,
++				.gpio.lnb_power.nr    = TBSECP3_GPIO_PIN(3, 2),
++			},
++			{
++				.ts_in = 2,
++				.i2c_bus_nr = 2,
++				.gpio.demod_reset.lvl = TBSECP3_GPIODEF_LOW,
++				.gpio.demod_reset.nr  = TBSECP3_GPIO_PIN(2, 0),
++				.gpio.lnb_power.lvl   = TBSECP3_GPIODEF_LOW,
++				.gpio.lnb_power.nr    = TBSECP3_GPIO_PIN(2, 2),
++			},
++			{
++				.ts_in = 1,
++				.i2c_bus_nr = 1,
++				.gpio.demod_reset.lvl = TBSECP3_GPIODEF_LOW,
++				.gpio.demod_reset.nr  = TBSECP3_GPIO_PIN(1, 0),
++				.gpio.lnb_power.lvl   = TBSECP3_GPIODEF_LOW,
++				.gpio.lnb_power.nr    = TBSECP3_GPIO_PIN(1, 2),
++			},
++			{
++				.ts_in = 0,
++				.i2c_bus_nr = 0,
++				.gpio.demod_reset.lvl = TBSECP3_GPIODEF_LOW,
++				.gpio.demod_reset.nr  = TBSECP3_GPIO_PIN(0, 0),
++				.gpio.lnb_power.lvl   = TBSECP3_GPIODEF_LOW,
++				.gpio.lnb_power.nr    = TBSECP3_GPIO_PIN(0, 2),
++			}, 
++		}
++	},
++	[TBSECP3_BOARD_TBS6905] = {
++		.board_id	= TBSECP3_BOARD_TBS6905,
++		.name		= "TurboSight TBS 6905 DVB-S/S2 ",
++		.adapters	= 4,
++		.i2c_speed	= 39,
++		.eeprom_i2c	= 2,
++		.adap_config	= {
++			{
++				.ts_in = 2,
++				.i2c_bus_nr = 2,
++				.gpio.demod_reset.lvl = TBSECP3_GPIODEF_LOW,
++				.gpio.demod_reset.nr  = TBSECP3_GPIO_PIN(2, 0),
++				.gpio.lnb_power.lvl   = TBSECP3_GPIODEF_LOW,
++				.gpio.lnb_power.nr    = TBSECP3_GPIO_PIN(2, 2),
++				.gpio.lnb_voltage.lvl = TBSECP3_GPIODEF_HIGH,
++				.gpio.lnb_voltage.nr  = TBSECP3_GPIO_PIN(2, 1),
++			},
++			{
++				.ts_in = 3,
++				.i2c_bus_nr = 2,
++				.gpio.lnb_power.lvl   = TBSECP3_GPIODEF_LOW,
++				.gpio.lnb_power.nr    = TBSECP3_GPIO_PIN(3, 2),
++				.gpio.lnb_voltage.lvl = TBSECP3_GPIODEF_HIGH,
++				.gpio.lnb_voltage.nr  = TBSECP3_GPIO_PIN(3, 1),
++			},
++			{
++				.ts_in = 0,
++				.i2c_bus_nr = 0,
++				.gpio.demod_reset.lvl = TBSECP3_GPIODEF_LOW,
++				.gpio.demod_reset.nr  = TBSECP3_GPIO_PIN(0, 0),
++				.gpio.lnb_power.lvl   = TBSECP3_GPIODEF_LOW,
++				.gpio.lnb_power.nr    = TBSECP3_GPIO_PIN(0, 2),
++				.gpio.lnb_voltage.lvl = TBSECP3_GPIODEF_HIGH,
++				.gpio.lnb_voltage.nr  = TBSECP3_GPIO_PIN(0, 1),
++			},
++			{
++				.ts_in = 1,
++				.i2c_bus_nr = 0,
++				.gpio.lnb_power.lvl   = TBSECP3_GPIODEF_LOW,
++				.gpio.lnb_power.nr    = TBSECP3_GPIO_PIN(1, 2),
++				.gpio.lnb_voltage.lvl = TBSECP3_GPIODEF_HIGH,
++				.gpio.lnb_voltage.nr  = TBSECP3_GPIO_PIN(1, 1),
++			},
++		}
++	},
++	[TBSECP3_BOARD_TBS6908] = {
++		.board_id	= TBSECP3_BOARD_TBS6908,
++		.name		= "TurboSight TBS 6908 DVB-S/S2 ",
++		.adapters	= 4,
++		.i2c_speed	= 39,
++		.eeprom_i2c	= 2,
++		.adap_config	= {
++			{
++				.ts_in = 2,
++				.i2c_bus_nr = 2,
++				.gpio.demod_reset.lvl = TBSECP3_GPIODEF_LOW,
++				.gpio.demod_reset.nr  = TBSECP3_GPIO_PIN(2, 0),
++				.gpio.lnb_power.lvl   = TBSECP3_GPIODEF_LOW,
++				.gpio.lnb_power.nr    = TBSECP3_GPIO_PIN(2, 2),
++				.gpio.lnb_voltage.lvl = TBSECP3_GPIODEF_HIGH,
++				.gpio.lnb_voltage.nr  = TBSECP3_GPIO_PIN(2, 1),
++			},
++
++			{
++				.ts_in = 3,
++				.i2c_bus_nr = 2,
++				.gpio.lnb_power.lvl   = TBSECP3_GPIODEF_LOW,
++				.gpio.lnb_power.nr    = TBSECP3_GPIO_PIN(3, 2),
++				.gpio.lnb_voltage.lvl = TBSECP3_GPIODEF_HIGH,
++				.gpio.lnb_voltage.nr  = TBSECP3_GPIO_PIN(3, 1),
++			},
++			{
++				.ts_in = 0,
++				.i2c_bus_nr = 0,
++				.gpio.demod_reset.lvl = TBSECP3_GPIODEF_LOW,
++				.gpio.demod_reset.nr  = TBSECP3_GPIO_PIN(0, 0),
++				.gpio.lnb_power.lvl   = TBSECP3_GPIODEF_LOW,
++				.gpio.lnb_power.nr    = TBSECP3_GPIO_PIN(0, 2),
++				.gpio.lnb_voltage.lvl = TBSECP3_GPIODEF_HIGH,
++				.gpio.lnb_voltage.nr  = TBSECP3_GPIO_PIN(0, 1),
++			},
++			{
++				.ts_in = 1,
++				.i2c_bus_nr = 0,
++				.gpio.lnb_power.lvl   = TBSECP3_GPIODEF_LOW,
++				.gpio.lnb_power.nr    = TBSECP3_GPIO_PIN(1, 2),
++				.gpio.lnb_voltage.lvl = TBSECP3_GPIODEF_HIGH,
++				.gpio.lnb_voltage.nr  = TBSECP3_GPIO_PIN(1, 1),
++			},
++		}
++	},
++	[TBSECP3_BOARD_TBS6909] = {
++		.board_id	= TBSECP3_BOARD_TBS6909,
++		.name		= "TurboSight TBS 6909 DVB-S/S2 ",
++		.adapters	= 8,
++		.i2c_speed	= 39,
++		.eeprom_i2c	= 0,
++		.eeprom_addr	= 0x10,
++		.adap_config	= {
++			{
++				.ts_in = 0,
++				.i2c_bus_nr = 0,
++				.gpio.demod_reset.lvl = TBSECP3_GPIODEF_LOW,
++				.gpio.demod_reset.nr  = TBSECP3_GPIO_PIN(0, 0),
++			}, 
++			{
++				.ts_in = 1,
++				.i2c_bus_nr = 0,
++			},
++			{
++				.ts_in = 2,
++				.i2c_bus_nr = 0,
++			},
++			{
++				.ts_in = 3,
++				.i2c_bus_nr = 0,
++			},
++			{
++				.ts_in = 4,
++				.i2c_bus_nr = 0,
++			},
++			{
++				.ts_in = 5,
++				.i2c_bus_nr = 0,
++			},
++			{
++				.ts_in = 6,
++				.i2c_bus_nr = 0,
++			},
++			{
++				.ts_in = 7,
++				.i2c_bus_nr = 0,
++			}
++		}
++	},
++	[TBSECP3_BOARD_TBS6910] = {
++		.board_id	= TBSECP3_BOARD_TBS6910,
++		.name		= "TurboSight TBS 6910 DVB-S/S2 + 2xCI ",
++		.adapters	= 2,
++		.i2c_speed	= 39,
++		.eeprom_i2c	= 1,
++		.adap_config	= {
++			{
++				.ts_in = 0,
++				.i2c_bus_nr = 0,
++				.gpio.demod_reset.lvl = TBSECP3_GPIODEF_LOW,
++				.gpio.demod_reset.nr  = TBSECP3_GPIO_PIN(0, 0),
++				.gpio.lnb_power.lvl   = TBSECP3_GPIODEF_LOW,
++				.gpio.lnb_power.nr    = TBSECP3_GPIO_PIN(0, 2),
++			},
++			{
++				.ts_in = 1,
++				.i2c_bus_nr = 1,
++				.gpio.demod_reset.lvl = TBSECP3_GPIODEF_LOW,
++				.gpio.demod_reset.nr  = TBSECP3_GPIO_PIN(1, 0),
++				.gpio.lnb_power.lvl   = TBSECP3_GPIODEF_LOW,
++				.gpio.lnb_power.nr    = TBSECP3_GPIO_PIN(1, 2),
++			},
++		}
++	},
++	[TBSECP3_BOARD_TBS6528] = {
++		.board_id	= TBSECP3_BOARD_TBS6528,
++		.name		= "TurboSight TBS 6528 DVB-S/S2/S2X/T/T2/C/C2/ISDB-T + CI ",
++		.adapters	= 1,
++		.i2c_speed	= 39,
++		.eeprom_i2c	= 0,
++		.eeprom_addr = 0xa0,
++		.adap_config	= {
++			{
++				.ts_in = 0,
++				.i2c_bus_nr = 0,
++				.gpio.demod_reset.lvl = TBSECP3_GPIODEF_LOW,
++				.gpio.demod_reset.nr  = TBSECP3_GPIO_PIN(0, 0),
++				.gpio.lnb_power.lvl   = TBSECP3_GPIODEF_LOW,
++				.gpio.lnb_power.nr    = TBSECP3_GPIO_PIN(0, 2),
++				.gpio.lnb_voltage.lvl = TBSECP3_GPIODEF_HIGH,
++				.gpio.lnb_voltage.nr  = TBSECP3_GPIO_PIN(0, 1),
++			},
++		}
++	},	
++	[TBSECP3_BOARD_TBS6590] = {
++		.board_id	= TBSECP3_BOARD_TBS6590,
++		.name		= "TurboSight TBS 6590 DVB-S/S2/S2X/T/T2/C/C2/ISDB-T + 2xCI ",
++		.adapters	= 2,
++		.i2c_speed	= 39,
++		.eeprom_i2c	= 0,
++		.eeprom_addr = 0xa0,
++		.adap_config	= {
++			{
++				.ts_in = 0,
++				.i2c_bus_nr = 0,
++				.gpio.demod_reset.lvl = TBSECP3_GPIODEF_LOW,
++				.gpio.demod_reset.nr  = TBSECP3_GPIO_PIN(0, 0),
++				.gpio.lnb_power.lvl   = TBSECP3_GPIODEF_LOW,
++				.gpio.lnb_power.nr    = TBSECP3_GPIO_PIN(0, 2),
++				.gpio.lnb_voltage.lvl = TBSECP3_GPIODEF_HIGH,
++				.gpio.lnb_voltage.nr  = TBSECP3_GPIO_PIN(0, 1),
++			},
++			{
++				.ts_in = 1,
++				.i2c_bus_nr = 0,
++				.gpio.lnb_power.lvl   = TBSECP3_GPIODEF_LOW,
++				.gpio.lnb_power.nr    = TBSECP3_GPIO_PIN(1, 2),
++				.gpio.lnb_voltage.lvl = TBSECP3_GPIODEF_HIGH,
++				.gpio.lnb_voltage.nr  = TBSECP3_GPIO_PIN(1, 1),
++			},
++		}
++	},
++	[TBSECP3_BOARD_TBS6290SE] = {
++		.board_id	= TBSECP3_BOARD_TBS6290SE,
++		.name		= "TurboSight TBS 6290SE DVB-T/T2/C + 2xCI ",
++		.i2c_speed	= 39,
++		.eeprom_i2c	= 1,
++		.adapters	= 2,
++		.adap_config	= {
++			{
++				.ts_in = 0,
++				.i2c_bus_nr = 0,
++				.gpio.demod_reset.lvl = TBSECP3_GPIODEF_NONE,
++				.gpio.demod_reset.nr  = TBSECP3_GPIO_PIN(0, 0),
++
++			}, 
++			{
++				.ts_in = 1,
++				.i2c_bus_nr = 1,
++				.gpio.demod_reset.lvl = TBSECP3_GPIODEF_NONE,
++				.gpio.demod_reset.nr  = TBSECP3_GPIO_PIN(2, 0),
++
++			},
++		}
++	},	
++	[TBSECP3_BOARD_TBS6281SE] = {
++		.board_id	= TBSECP3_BOARD_TBS6281SE,
++		.name		= "TurboSight TBS 6281SE DVB-T/T2/C ",
++		.i2c_speed	= 39,
++		.eeprom_i2c	= 1,
++		.adapters	= 2,
++		.adap_config	= {
++			{
++				.ts_in = 1,
++				.i2c_bus_nr = 1,
++				.gpio.demod_reset.lvl = TBSECP3_GPIODEF_LOW,
++				.gpio.demod_reset.nr  = TBSECP3_GPIO_PIN(1, 0),
++			}, 
++			{
++				.ts_in = 2,
++				.i2c_bus_nr = 2,
++				.gpio.demod_reset.lvl = TBSECP3_GPIODEF_LOW,
++				.gpio.demod_reset.nr  = TBSECP3_GPIO_PIN(2, 0),
++			},
++		}
++	},
++	[TBSECP3_BOARD_TBS6909X] = {
++		.board_id	= TBSECP3_BOARD_TBS6909X,
++		.name		= "TurboSight TBS 6909x (Octa DVB-S/S2/S2X)",
++		.adapters	= 8,
++		.eeprom_i2c	= 0,
++		.eeprom_addr	= 0x10,
++		.adap_config	= {
++			{
++				.ts_in = 0,
++				.i2c_bus_nr = 0,
++				.gpio.demod_reset.lvl = TBSECP3_GPIODEF_LOW,
++				.gpio.demod_reset.nr  = TBSECP3_GPIO_PIN(0, 0),
++			}, 
++			{
++				.ts_in = 1,
++				.i2c_bus_nr = 0,
++			},
++			{
++				.ts_in = 2,
++				.i2c_bus_nr = 0,
++			},
++			{
++				.ts_in = 3,
++				.i2c_bus_nr = 0,
++			},
++			{
++				.ts_in = 4,
++				.i2c_bus_nr = 0,
++			},
++			{
++				.ts_in = 5,
++				.i2c_bus_nr = 0,
++			},
++			{
++				.ts_in = 6,
++				.i2c_bus_nr = 0,
++			},
++			{
++				.ts_in = 7,
++				.i2c_bus_nr = 0,
++			}
++		}
++	},
++	[TBSECP3_BOARD_TBS6903X] = {
++		.board_id	= TBSECP3_BOARD_TBS6903X,
++		.name		= "TurboSight TBS 6903x (Dual DVB-S/S2/S2X)",
++		.adapters	= 2,
++		.eeprom_i2c	= 0,
++		.eeprom_addr	= 0x10,
++		.adap_config	= {
++			{
++				.ts_in = 0,
++				.i2c_bus_nr = 0,
++				.gpio.demod_reset.lvl = TBSECP3_GPIODEF_LOW,
++				.gpio.demod_reset.nr  = TBSECP3_GPIO_PIN(0, 0),
++				.gpio.lnb_power.lvl   = TBSECP3_GPIODEF_LOW,
++				.gpio.lnb_power.nr    = TBSECP3_GPIO_PIN(0, 2),
++				.gpio.lnb_voltage.lvl = TBSECP3_GPIODEF_HIGH,
++				.gpio.lnb_voltage.nr  = TBSECP3_GPIO_PIN(0, 1),
++			}, 
++			{
++				.ts_in = 1,
++				.i2c_bus_nr = 0,
++				.gpio.lnb_power.lvl   = TBSECP3_GPIODEF_LOW,
++				.gpio.lnb_power.nr    = TBSECP3_GPIO_PIN(1, 2),
++				.gpio.lnb_voltage.lvl = TBSECP3_GPIODEF_HIGH,
++				.gpio.lnb_voltage.nr  = TBSECP3_GPIO_PIN(1, 1),
++			},
++		}
++	},
++	
++	[TBSECP3_BOARD_TBS6912] = {
++		.board_id	= TBSECP3_BOARD_TBS6912,
++		.name		= "TurboSight TBS 6912 (Dual DVB-S/S2/S2X CI card)",
++		.adapters	= 2,
++		.eeprom_i2c = 0,
++		.eeprom_addr	= 0x10,
++		.adap_config	= {
++			{
++				.ts_in = 0,
++				.i2c_bus_nr = 0,
++				.gpio.demod_reset.lvl = TBSECP3_GPIODEF_LOW,
++				.gpio.demod_reset.nr  = TBSECP3_GPIO_PIN(0, 0),
++				.gpio.lnb_power.lvl   = TBSECP3_GPIODEF_LOW,
++				.gpio.lnb_power.nr    = TBSECP3_GPIO_PIN(0, 2),
++				.gpio.lnb_voltage.lvl = TBSECP3_GPIODEF_HIGH,
++				.gpio.lnb_voltage.nr  = TBSECP3_GPIO_PIN(0, 1),
++			}, 
++			{
++				.ts_in = 1,
++				.i2c_bus_nr = 0,
++				.gpio.lnb_power.lvl   = TBSECP3_GPIODEF_LOW,
++				.gpio.lnb_power.nr    = TBSECP3_GPIO_PIN(1, 2),
++				.gpio.lnb_voltage.lvl = TBSECP3_GPIODEF_HIGH,
++				.gpio.lnb_voltage.nr  = TBSECP3_GPIO_PIN(1, 1),
++			},
++
++		}
++	},
++};
+diff -urN linux.orig/drivers/media/pci/tbsecp3/tbsecp3-core.c linux/drivers/media/pci/tbsecp3/tbsecp3-core.c
+--- linux.orig/drivers/media/pci/tbsecp3/tbsecp3-core.c	1970-01-01 01:00:00.000000000 +0100
++++ linux/drivers/media/pci/tbsecp3/tbsecp3-core.c	2024-08-04 19:53:33.612091581 +0100
+@@ -0,0 +1,420 @@
++/*
++    TBS ECP3 FPGA based cards PCIe driver
++
++    This program is free software: you can redistribute it and/or modify
++    it under the terms of the GNU General Public License as published by
++    the Free Software Foundation, either version 3 of the License, or
++    (at your option) any later version.
++
++    This program is distributed in the hope that it will be useful,
++    but WITHOUT ANY WARRANTY; without even the implied warranty of
++    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++    GNU General Public License for more details.
++
++    You should have received a copy of the GNU General Public License
++    along with this program.  If not, see <http://www.gnu.org/licenses/>.
++*/
++
++#include "tbsecp3.h"
++
++static bool enable_msi = true;
++module_param(enable_msi, bool, 0444);
++MODULE_PARM_DESC(enable_msi, "use an msi interrupt if available");
++
++
++void tbsecp3_gpio_set_pin(struct tbsecp3_dev *dev,
++		struct tbsecp3_gpio_pin *pin, int state)
++{
++	u32 tmp, bank, bit;
++
++	if (pin->lvl == TBSECP3_GPIODEF_NONE)
++		return;
++
++	if (pin->lvl == TBSECP3_GPIODEF_LOW)
++		state = !state;
++
++	bank = (pin->nr >> 3) & ~3;
++	bit = pin->nr % 32;
++
++	tmp = tbs_read(TBSECP3_GPIO_BASE, bank);
++	if (state)
++		tmp |= 1 << bit;
++	else
++		tmp &= ~(1 << bit);
++	tbs_write(TBSECP3_GPIO_BASE, bank, tmp);
++}
++
++static irqreturn_t tbsecp3_irq_handler(int irq, void *dev_id)
++{
++	struct tbsecp3_dev *dev = (struct tbsecp3_dev *) dev_id;
++	struct tbsecp3_i2c *i2c;
++	int i, in;
++	u32 stat = tbs_read(TBSECP3_INT_BASE, TBSECP3_INT_STAT);
++
++	tbs_write(TBSECP3_INT_BASE, TBSECP3_INT_STAT, stat);
++
++	if (stat & 0x000000f0) {
++		/* dma0~3 */
++		for (i = 0; i < dev->info->adapters; i++) {
++			in = dev->adapter[i].cfg->ts_in;
++			if (stat & TBSECP3_DMA_IF(in)){
++				tasklet_schedule(&dev->adapter[i].tasklet);
++				}
++		}
++	}
++
++	if (stat & 0x00000f00) {
++		/* dma 4~7*/
++		for (i = 4; i < dev->info->adapters; i++) {
++			in = dev->adapter[i].cfg->ts_in;
++			if (stat & TBSECP3_DMA_IF(in)){
++				tasklet_schedule(&dev->adapter[i].tasklet);
++				}
++		}
++	}
++
++	if (stat & 0x0000f000) {
++		/* dma8~11 */
++		for (i = 8; i < dev->info->adapters; i++) {
++			in = dev->adapter[i].cfg->ts_in;
++			if (stat & TBSECP3_DMA_IF1(in)){
++				tasklet_schedule(&dev->adapter[i].tasklet);
++				}
++		}
++	}
++
++	if (stat & 0x000f0000) {
++		/* dma 12~15*/
++		for (i = 12; i < dev->info->adapters; i++) {
++			in = dev->adapter[i].cfg->ts_in;
++			if (stat & TBSECP3_DMA_IF1(in)){
++				tasklet_schedule(&dev->adapter[i].tasklet);
++				}
++		}
++	}
++	if (stat & 0x0000000f) {
++		/* i2c */
++		for (i = 0; i < 4; i++) {
++			i2c = &dev->i2c_bus[i];
++			if (stat & TBSECP3_I2C_IF(i)) {
++				i2c->done = 1;
++				wake_up(&i2c->wq);
++			}
++		}
++	}
++
++	tbs_write(TBSECP3_INT_BASE, TBSECP3_INT_EN, 1);
++	return IRQ_HANDLED;
++}
++
++static int tbsecp3_adapters_attach(struct tbsecp3_dev *dev)
++{
++	int i, ret = 0;
++	for (i = 0; i < dev->info->adapters; i++) {
++		ret = tbsecp3_dvb_init(&dev->adapter[i]);
++		if (ret) {
++			dev_err(&dev->pci_dev->dev,
++				"adapter%d attach failed\n",
++				dev->adapter[i].nr);
++			dev->adapter[i].nr = -1;
++		}
++	}
++	return 0;
++}
++
++static void tbsecp3_adapters_detach(struct tbsecp3_dev *dev)
++{
++	struct tbsecp3_adapter *adapter;
++	int i;
++
++	for (i = 0; i < dev->info->adapters; i++) {
++		adapter = &dev->adapter[i];
++
++		/* attach has failed, nothing to do */
++		if (adapter->nr == -1)
++			continue;
++
++		tbsecp3_i2c_remove_clients(adapter);
++		tbsecp3_dvb_exit(adapter);
++	}
++}
++
++static void tbsecp3_adapters_init(struct tbsecp3_dev *dev)
++{
++	struct tbsecp3_adapter *adapter = dev->adapter;
++	int i;
++
++	for (i = 0; i < dev->info->adapters; i++) {
++		adapter = &dev->adapter[i];
++		adapter->nr = i;
++		adapter->cfg = &dev->info->adap_config[i];
++		adapter->dev = dev;
++		adapter->i2c = &dev->i2c_bus[adapter->cfg->i2c_bus_nr];
++	}
++}
++
++static void tbsecp3_adapters_release(struct tbsecp3_dev *dev)
++{
++	struct tbsecp3_adapter *adapter;
++	int i;
++
++	for (i = 0; i < dev->info->adapters; i++) {
++		adapter = &dev->adapter[i];
++		tasklet_kill(&adapter->tasklet);
++	}
++}
++
++
++static bool tbsecp3_enable_msi(struct pci_dev *pci_dev, struct tbsecp3_dev *dev)
++{
++	int err;
++
++	if (!enable_msi) {
++		dev_warn(&dev->pci_dev->dev,
++			"MSI disabled by module parameter 'enable_msi'\n");
++		return false;
++	}
++
++	err = pci_enable_msi(pci_dev);
++	if (err) {
++		dev_err(&dev->pci_dev->dev,
++			"Failed to enable MSI interrupt."
++			" Falling back to a shared IRQ\n");
++		return false;
++	}
++
++	/* no error - so request an msi interrupt */
++	err = request_irq(pci_dev->irq, tbsecp3_irq_handler, 0,
++				"tbsecp3", dev);
++	if (err) {
++		/* fall back to legacy interrupt */
++		dev_err(&dev->pci_dev->dev,
++			"Failed to get an MSI interrupt."
++			" Falling back to a shared IRQ\n");
++		pci_disable_msi(pci_dev);
++		return false;
++	}
++	return true;
++}
++
++
++static int tbsecp3_probe(struct pci_dev *pdev, const struct pci_device_id *id)
++{
++	struct tbsecp3_dev *dev;
++	int ret = -ENODEV;
++
++	if (pci_enable_device(pdev) < 0)
++		return -ENODEV;
++
++	if(dma_set_mask(&pdev->dev, DMA_BIT_MASK(64)))
++		if(dma_set_mask(&pdev->dev, DMA_BIT_MASK(32)))
++		{
++			dev_err(&pdev->dev, "64/32-bit PCI DMA not supported\n");
++			goto err0;	
++		}
++	
++	pci_set_master(pdev);
++
++	dev = kzalloc(sizeof(struct tbsecp3_dev), GFP_KERNEL);
++	if (!dev) {
++		ret = -ENOMEM;
++		goto err0;
++	}
++
++	dev->pci_dev = pdev;
++	pci_set_drvdata(pdev, dev);
++
++	dev->info = (struct tbsecp3_board *) id->driver_data;
++	dev_info(&pdev->dev, "%s\n", dev->info->name);
++
++	dev->lmmio = ioremap(pci_resource_start(pdev, 0),
++				pci_resource_len(pdev, 0));
++	if (!dev->lmmio) {
++		ret = -ENOMEM;
++		goto err1;
++	}
++
++	tbs_write(TBSECP3_INT_BASE, TBSECP3_INT_EN, 0);
++	tbs_write(TBSECP3_INT_BASE, TBSECP3_INT_STAT, 0xff);
++
++	tbsecp3_adapters_init(dev);
++
++	/* dma */
++	ret = tbsecp3_dma_init(dev);
++	if (ret < 0)
++		goto err2;
++
++	/* i2c */
++	ret = tbsecp3_i2c_init(dev);
++	if (ret < 0)
++		goto err3;
++
++	/* interrupts */
++	if (tbsecp3_enable_msi(pdev, dev)) {
++		dev->msi = true;
++	} else {
++		ret = request_irq(pdev->irq, tbsecp3_irq_handler,
++				IRQF_SHARED, "tbsecp3", dev);
++		if (ret < 0) {
++			dev_err(&pdev->dev, "%s: can't get IRQ %d\n",
++				dev->info->name, pdev->irq);
++			goto err4;
++		}
++		dev->msi = false;
++	}
++	/* global interrupt enable */
++	tbs_write(TBSECP3_INT_BASE, TBSECP3_INT_EN, 1);
++
++	ret = tbsecp3_adapters_attach(dev);
++	if (ret < 0)
++		goto err5;
++	
++	dev_info(&pdev->dev, "%s: PCI %s, IRQ %d, MMIO 0x%lx\n",
++		dev->info->name, pci_name(pdev), pdev->irq,
++		(unsigned long) pci_resource_start(pdev, 0));
++
++	//dev_info(&dev->pci_dev->dev, "%s ready\n", dev->info->name);
++	return 0;
++
++err5:
++	tbsecp3_adapters_detach(dev);
++
++	tbs_write(TBSECP3_INT_BASE, TBSECP3_INT_EN, 0);
++	free_irq(dev->pci_dev->irq, dev);
++	if (dev->msi) {
++		pci_disable_msi(pdev);
++		dev->msi = false;
++	}
++err4:
++	tbsecp3_i2c_exit(dev);
++err3:
++	tbsecp3_dma_free(dev);
++err2:
++	tbsecp3_adapters_release(dev);
++	iounmap(dev->lmmio);
++err1:
++	pci_set_drvdata(pdev, NULL);
++	kfree(dev);
++err0:
++	pci_disable_device(pdev);
++	dev_err(&pdev->dev, "probe error\n");
++	return ret;
++}
++
++static void tbsecp3_remove(struct pci_dev *pdev)
++{
++	struct tbsecp3_dev *dev = pci_get_drvdata(pdev);
++
++	/* disable interrupts */
++	tbs_write(TBSECP3_INT_BASE, TBSECP3_INT_EN, 0); 
++	free_irq(pdev->irq, dev);
++	if (dev->msi) {
++		pci_disable_msi(pdev);
++		dev->msi = false;
++	}
++	tbsecp3_adapters_detach(dev);
++	tbsecp3_adapters_release(dev);
++	tbsecp3_dma_free(dev);
++	tbsecp3_i2c_exit(dev);
++	iounmap(dev->lmmio);
++	pci_set_drvdata(pdev, NULL);
++	pci_disable_device(pdev);
++	kfree(dev);
++}
++
++static int tbsecp3_resume(struct pci_dev *pdev)
++{
++	struct tbsecp3_dev *dev = pci_get_drvdata(pdev);
++	/* re-init registers */
++	tbsecp3_i2c_reg_init(dev);
++	tbsecp3_dma_reg_init(dev);
++	tbs_write(TBSECP3_INT_BASE, TBSECP3_INT_EN, 1);
++	return 0;
++}
++
++/* PCI IDs */
++#define TBSECP3_ID(_board_id,_subvend,_subdev) { \
++	.vendor = TBSECP3_VID, .device = TBSECP3_PID, \
++	.subvendor = _subvend, .subdevice = _subdev, \
++	.driver_data = (unsigned long)&tbsecp3_boards[_board_id] }
++
++static const struct pci_device_id tbsecp3_id_table[] = {
++	TBSECP3_ID(TBSECP3_BOARD_TBS6205,0x6205,0x0001),
++	TBSECP3_ID(TBSECP3_BOARD_TBS6281SE,0x6281,0x0002),
++	TBSECP3_ID(TBSECP3_BOARD_TBS6290SE,0x6290,0x0002),
++	TBSECP3_ID(TBSECP3_BOARD_TBS6290TD,0x6290,0x0008),
++	TBSECP3_ID(TBSECP3_BOARD_TBS6209,0x6209,0x0001),
++	TBSECP3_ID(TBSECP3_BOARD_TBS6522,0x6522,0x0002),
++	TBSECP3_ID(TBSECP3_BOARD_TBS6528,0x6528,PCI_ANY_ID),
++	TBSECP3_ID(TBSECP3_BOARD_TBS6590,0x6590,0x0001),
++	TBSECP3_ID(TBSECP3_BOARD_TBS6902,0x6902,0x1132),
++	TBSECP3_ID(TBSECP3_BOARD_TBS6902,0x6902,0x0001),
++	TBSECP3_ID(TBSECP3_BOARD_TBS6902,0x6902,0x0002),
++	TBSECP3_ID(TBSECP3_BOARD_TBS6902,0x6902,0x0003),
++	TBSECP3_ID(TBSECP3_BOARD_TBS6903,0x6903,0x0001),
++	TBSECP3_ID(TBSECP3_BOARD_TBS6904,0x6904,0x0001),
++	TBSECP3_ID(TBSECP3_BOARD_TBS6904,0x6904,0x1131),
++	TBSECP3_ID(TBSECP3_BOARD_TBS6905,0x6905,PCI_ANY_ID),
++	TBSECP3_ID(TBSECP3_BOARD_TBS6908,0x6908,PCI_ANY_ID),
++	TBSECP3_ID(TBSECP3_BOARD_TBS6909,0x6909,0x0001),
++	TBSECP3_ID(TBSECP3_BOARD_TBS6910,0x6910,0x0001),
++	TBSECP3_ID(TBSECP3_BOARD_TBS6704,0x6704,PCI_ANY_ID),
++	TBSECP3_ID(TBSECP3_BOARD_TBS6814,0x6814,PCI_ANY_ID),
++	TBSECP3_ID(TBSECP3_BOARD_TBS6514,0x6514,PCI_ANY_ID),
++	TBSECP3_ID(TBSECP3_BOARD_TBS690a,0x690a,PCI_ANY_ID),
++	TBSECP3_ID(TBSECP3_BOARD_TBS6301,0x6301,0x0001),
++	TBSECP3_ID(TBSECP3_BOARD_TBS6304,0x6304,0x0001),
++	TBSECP3_ID(TBSECP3_BOARD_TBS6308,0x6308,0x0001),
++	TBSECP3_ID(TBSECP3_BOARD_TBS6308X,0x6308,0x0010),
++	TBSECP3_ID(TBSECP3_BOARD_TBS6312X,0x6312,0x0010),
++	TBSECP3_ID(TBSECP3_BOARD_TBS6909X,0x6909,0x0010),
++	TBSECP3_ID(TBSECP3_BOARD_TBS6909X,0x6909,0x0009),
++	TBSECP3_ID(TBSECP3_BOARD_TBS6909X,0x6909,0x0019),	
++	TBSECP3_ID(TBSECP3_BOARD_TBS6903X,0x6903,0x0020),
++	TBSECP3_ID(TBSECP3_BOARD_TBS6903X,0x6903,0x0021),
++	TBSECP3_ID(TBSECP3_BOARD_TBS6903X,0x6903,0x8888),
++	TBSECP3_ID(TBSECP3_BOARD_TBS6904X,0x6904,0x2000),
++	TBSECP3_ID(TBSECP3_BOARD_TBS6912,0x6912,0x0020),
++	TBSECP3_ID(TBSECP3_BOARD_TBS6504,0x6504,0x0001),
++	TBSECP3_ID(TBSECP3_BOARD_TBS6508,0x6508,0x0001),
++	TBSECP3_ID(TBSECP3_BOARD_TBS6302SE,0x6302,0x0001),
++	TBSECP3_ID(TBSECP3_BOARD_TBS6304,0x2605,PCI_ANY_ID),
++	TBSECP3_ID(TBSECP3_BOARD_TBS6902SE,0x6902,0x0007),
++	TBSECP3_ID(TBSECP3_BOARD_TBS6904SE,0x6904,0x0020),
++	TBSECP3_ID(TBSECP3_BOARD_TBS6301SE,0x6301,0x0005),
++	TBSECP3_ID(TBSECP3_BOARD_TBS6301SE,0x6302,0x0005),
++	TBSECP3_ID(TBSECP3_BOARD_TBS6301SE,0x6301,0x0004),
++	TBSECP3_ID(TBSECP3_BOARD_TBS6910SE,0x6910,0x0006),
++	TBSECP3_ID(TBSECP3_BOARD_TBS7901,0x7901,0x0001),
++	TBSECP3_ID(TBSECP3_BOARD_TBS6209SE,0x6209,0x0006),	
++	TBSECP3_ID(TBSECP3_BOARD_TBS7901,0x7901,0x0001),
++	TBSECP3_ID(TBSECP3_BOARD_TBS7230,0x7230,0x0006),
++	TBSECP3_ID(TBSECP3_BOARD_TBS6302X,0x6302,0x0010),	
++	TBSECP3_ID(TBSECP3_BOARD_TBS6302T,0x6302,0x0009),
++	TBSECP3_ID(TBSECP3_BOARD_TBS6304X,0x6304,0x0010),	
++	TBSECP3_ID(TBSECP3_BOARD_TBS6205SE,0x6205,0x0003),
++	TBSECP3_ID(TBSECP3_BOARD_TBS6281TD,0x6281,0x0003),
++	TBSECP3_ID(TBSECP3_BOARD_TBS6909SE,0x6909,0x0066),
++	TBSECP3_ID(TBSECP3_BOARD_TBS6304T,0x6304,0x0009),
++	TBSECP3_ID(TBSECP3_BOARD_TBS6522H,0x6522,0x0004),
++	TBSECP3_ID(TBSECP3_BOARD_TBS6504H,0x6504,0x0008),
++	TBSECP3_ID(TBSECP3_BOARD_TBS6590SE,0x6590,0x0002),
++	TBSECP3_ID(TBSECP3_BOARD_TBS6916,0x6916,0x0001),			
++	{0}
++};
++MODULE_DEVICE_TABLE(pci, tbsecp3_id_table);
++
++static struct pci_driver tbsecp3_driver = {
++	.name = "TBSECP3 driver",
++	.id_table = tbsecp3_id_table,
++	.probe    = tbsecp3_probe,
++	.remove   = tbsecp3_remove,
++	.resume   = tbsecp3_resume,
++	.suspend  = NULL,
++};
++
++module_pci_driver(tbsecp3_driver);
++
++MODULE_AUTHOR("Luis Alves <ljalvs@gmail.com>");
++MODULE_DESCRIPTION("TBS ECP3 driver");
++MODULE_LICENSE("GPL");
+diff -urN linux.orig/drivers/media/pci/tbsecp3/tbsecp3-dma.c linux/drivers/media/pci/tbsecp3/tbsecp3-dma.c
+--- linux.orig/drivers/media/pci/tbsecp3/tbsecp3-dma.c	1970-01-01 01:00:00.000000000 +0100
++++ linux/drivers/media/pci/tbsecp3/tbsecp3-dma.c	2024-08-04 19:53:33.612091581 +0100
+@@ -0,0 +1,178 @@
++/*
++    TBS ECP3 FPGA based cards PCIe driver
++
++    This program is free software: you can redistribute it and/or modify
++    it under the terms of the GNU General Public License as published by
++    the Free Software Foundation, either version 3 of the License, or
++    (at your option) any later version.
++
++    This program is distributed in the hope that it will be useful,
++    but WITHOUT ANY WARRANTY; without even the implied warranty of
++    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++    GNU General Public License for more details.
++
++    You should have received a copy of the GNU General Public License
++    along with this program.  If not, see <http://www.gnu.org/licenses/>.
++*/
++
++#include "tbsecp3.h"
++
++static unsigned int dma_pkts[16] = {128, 128, 128, 128, 128, 128, 128, 128,128, 128, 128, 128, 128, 128, 128, 128};
++module_param_array(dma_pkts, int, NULL, 0444); /* No /sys/module write access */
++MODULE_PARM_DESC(dma_pkts, "DMA buffer size in TS packets (16-256), default 128");
++
++#define TS_PACKET_SIZE		188
++
++static void tbsecp3_dma_tasklet(unsigned long adap)
++{
++	struct tbsecp3_adapter *adapter = (struct tbsecp3_adapter *) adap;
++	struct tbsecp3_dev *dev = adapter->dev;
++	u32 read_buffer, next_buffer;
++	u8* data;
++	int i;
++
++	spin_lock(&adapter->adap_lock);
++
++	if (adapter->dma.cnt < TBSECP3_DMA_PRE_BUFFERS)
++	{
++		next_buffer = (tbs_read(adapter->dma.base, TBSECP3_DMA_STAT) - TBSECP3_DMA_PRE_BUFFERS + 1) & (TBSECP3_DMA_BUFFERS - 1);
++		adapter->dma.cnt++;
++	}
++        else
++        {
++		next_buffer = (tbs_read(adapter->dma.base, TBSECP3_DMA_STAT) - TBSECP3_DMA_PRE_BUFFERS + 1) & (TBSECP3_DMA_BUFFERS - 1);
++		read_buffer = (u32)adapter->dma.next_buffer;
++
++		while (read_buffer != next_buffer)
++		{
++			data = adapter->dma.buf[read_buffer];
++
++			if (data[adapter->dma.offset] != 0x47) {
++			/* Find sync byte offset with crude force (this might fail!) */
++				for (i = 0; i < TS_PACKET_SIZE; i++)
++					if ((data[i] == 0x47) &&
++					(data[i + TS_PACKET_SIZE] == 0x47) &&
++					(data[i + 2 * TS_PACKET_SIZE] == 0x47) &&
++					(data[i + 4 * TS_PACKET_SIZE] == 0x47)) {
++						adapter->dma.offset = i;
++						break;
++				}
++			}
++
++			if (adapter->dma.offset != 0) {
++				data += adapter->dma.offset;
++				/* Copy remains of last packet from buffer 0 behind last one */
++				if (read_buffer == (TBSECP3_DMA_BUFFERS - 1)) {
++					memcpy( adapter->dma.buf[TBSECP3_DMA_BUFFERS],
++						adapter->dma.buf[0], adapter->dma.offset);
++				}
++			}
++			dvb_dmx_swfilter_packets(&adapter->demux, data, adapter->dma.buffer_pkts);
++			read_buffer = (read_buffer + 1) & (TBSECP3_DMA_BUFFERS - 1);
++		}
++	}
++
++	adapter->dma.next_buffer = (u8)next_buffer;
++
++	spin_unlock(&adapter->adap_lock);
++
++}
++
++void tbsecp3_dma_enable(struct tbsecp3_adapter *adap)
++{
++	struct tbsecp3_dev *dev = adap->dev;
++
++	spin_lock_irq(&adap->adap_lock);
++	adap->dma.offset = 0;
++	adap->dma.cnt = 0;
++	adap->dma.next_buffer= 0;
++	tbs_read(adap->dma.base, TBSECP3_DMA_STAT);
++	tbs_write(TBSECP3_INT_BASE, TBSECP3_DMA_IE(adap->cfg->ts_in), 1); 
++	tbs_write(adap->dma.base, TBSECP3_DMA_EN, 1);
++	spin_unlock_irq(&adap->adap_lock);
++}
++
++void tbsecp3_dma_disable(struct tbsecp3_adapter *adap)
++{
++	struct tbsecp3_dev *dev = adap->dev;
++
++	spin_lock_irq(&adap->adap_lock);
++	tbs_read(adap->dma.base, TBSECP3_DMA_STAT);
++	tbs_write(TBSECP3_INT_BASE, TBSECP3_DMA_IE(adap->cfg->ts_in), 0);
++	tbs_write(adap->dma.base, TBSECP3_DMA_EN, 0);
++	spin_unlock_irq(&adap->adap_lock);
++}
++
++void tbsecp3_dma_reg_init(struct tbsecp3_dev *dev)
++{
++	int i;
++	struct tbsecp3_adapter *adapter = dev->adapter;
++
++	for (i = 0; i < dev->info->adapters; i++) {
++		tbs_write(adapter->dma.base, TBSECP3_DMA_EN, 0);
++		tbs_write(adapter->dma.base, TBSECP3_DMA_ADDRH, 0);
++		tbs_write(adapter->dma.base, TBSECP3_DMA_ADDRL, (u32) adapter->dma.dma_addr);
++		tbs_write(adapter->dma.base, TBSECP3_DMA_TSIZE, adapter->dma.page_size);
++		tbs_write(adapter->dma.base, TBSECP3_DMA_BSIZE, adapter->dma.buffer_size);
++		adapter++;
++	}
++}
++
++void tbsecp3_dma_free(struct tbsecp3_dev *dev)
++{
++	struct tbsecp3_adapter *adapter = dev->adapter;
++	int i;
++	for (i = 0; i < dev->info->adapters; i++) {
++		if (adapter->dma.buf[0] == NULL)
++			continue;
++
++		dma_free_coherent(&dev->pci_dev->dev,
++			adapter->dma.page_size + 0x100,
++			adapter->dma.buf[0], adapter->dma.dma_addr);
++		adapter->dma.buf[0] = NULL;
++		adapter++;
++	}
++}
++
++int tbsecp3_dma_init(struct tbsecp3_dev *dev)
++{
++	struct tbsecp3_adapter *adapter = dev->adapter;
++	int i, j;
++
++	for (i = 0; i < dev->info->adapters; i++) {
++		if (dma_pkts[i] < 16)
++			dma_pkts[i] = 16;
++		if (dma_pkts[i] > 256)
++			dma_pkts[i] = 256;
++
++		adapter->dma.buffer_pkts = dma_pkts[i];
++		adapter->dma.buffer_size = dma_pkts[i] * TS_PACKET_SIZE;
++		adapter->dma.page_size = adapter->dma.buffer_size * TBSECP3_DMA_BUFFERS;
++
++		adapter->dma.buf[0] = dma_alloc_coherent(&dev->pci_dev->dev,
++				adapter->dma.page_size + 0x100,
++				&adapter->dma.dma_addr, GFP_KERNEL);
++		if (!adapter->dma.buf[0])
++			goto err;
++
++		dev_dbg(&dev->pci_dev->dev,
++			"TS in %d: DMA page %d bytes, %d bytes (%d TS packets) per %d buffers\n", adapter->cfg->ts_in, 
++			 adapter->dma.page_size, adapter->dma.buffer_size, adapter->dma.buffer_pkts, TBSECP3_DMA_BUFFERS);
++
++		adapter->dma.base = TBSECP3_DMA_BASE(adapter->cfg->ts_in);
++		adapter->dma.cnt = 0;
++		adapter->dma.next_buffer = 0;
++		for (j = 1; j < TBSECP3_DMA_BUFFERS + 1; j++)
++			adapter->dma.buf[j] = adapter->dma.buf[j-1] + adapter->dma.buffer_size;
++
++		tasklet_init(&adapter->tasklet, tbsecp3_dma_tasklet, (unsigned long) adapter);
++		spin_lock_init(&adapter->adap_lock);
++		adapter++;
++	}
++	tbsecp3_dma_reg_init(dev);
++	return 0;
++err:
++	dev_err(&dev->pci_dev->dev, "dma: memory alloc failed\n");
++	tbsecp3_dma_free(dev);
++	return -ENOMEM;
++}
+diff -urN linux.orig/drivers/media/pci/tbsecp3/tbsecp3-dvb.c linux/drivers/media/pci/tbsecp3/tbsecp3-dvb.c
+--- linux.orig/drivers/media/pci/tbsecp3/tbsecp3-dvb.c	1970-01-01 01:00:00.000000000 +0100
++++ linux/drivers/media/pci/tbsecp3/tbsecp3-dvb.c	2024-08-04 19:53:33.668091979 +0100
+@@ -0,0 +1,481 @@
++/*
++    TBS ECP3 FPGA based cards PCIe driver
++
++    This program is free software: you can redistribute it and/or modify
++    it under the terms of the GNU General Public License as published by
++    the Free Software Foundation, either version 3 of the License, or
++    (at your option) any later version.
++
++    This program is distributed in the hope that it will be useful,
++    but WITHOUT ANY WARRANTY; without even the implied warranty of
++    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++    GNU General Public License for more details.
++
++    You should have received a copy of the GNU General Public License
++    along with this program.  If not, see <http://www.gnu.org/licenses/>.
++*/
++
++#include "tbsecp3.h"
++
++#include "tas2101.h"
++#include "av201x.h"
++
++DVB_DEFINE_MOD_OPT_ADAPTER_NR(adapter_nr);
++
++static bool swapfe = false;
++module_param(swapfe, bool, 0444);
++MODULE_PARM_DESC(swapfe, "swap combo frontends order");
++
++static bool ciclock = false;
++module_param(ciclock, bool, 0444);
++MODULE_PARM_DESC(ciclock, "whether to manually set ci clock. false=set by fpga,true=set by si5351");
++
++struct sec_priv {
++	struct tbsecp3_adapter *adap;
++	int (*set_voltage)(struct dvb_frontend *fe,
++			   enum fe_sec_voltage voltage);
++};
++
++static void ecp3_spi_read(struct i2c_adapter *i2c,u8 reg, u32 *buf)
++{	
++	struct tbsecp3_i2c *i2c_adap = i2c_get_adapdata(i2c);
++	struct tbsecp3_dev *dev = i2c_adap->dev;
++	*buf = tbs_read(TBSECP3_GPIO_BASE,reg );
++
++	//printk(" tbsecp3-dvb : ecp3_spi_read **********%x = %x*******\n",reg,*buf);
++
++	return ;
++}
++
++static void ecp3_spi_write(struct i2c_adapter *i2c,u8 reg, u32 buf)
++{
++	struct tbsecp3_i2c *i2c_adap = i2c_get_adapdata(i2c);
++	struct tbsecp3_dev *dev = i2c_adap->dev;
++	//printk(" tbsecp3-dvb : ecp3_spi_write **********%x = %x*******\n",reg,buf);
++	tbs_write(TBSECP3_GPIO_BASE, reg, buf);
++
++	return ;
++}
++
++static void ecp3_eeprom_read(struct i2c_adapter *i2c,u8 reg, u8 *buf)
++{
++	struct tbsecp3_i2c *i2c_adap = i2c_get_adapdata(i2c);
++	struct tbsecp3_dev *dev = i2c_adap->dev;
++	u8 eeprom_bus_nr = dev->info->eeprom_i2c;
++	struct i2c_adapter *i2c_eep = &dev->i2c_bus[eeprom_bus_nr].i2c_adap;
++
++	struct i2c_msg msg[] = {
++		{ .addr = 0x50, .flags = 0,
++		  .buf = &reg, .len = 1 },
++		{ .addr = 0x50, .flags = I2C_M_RD,
++		  .buf = buf, .len = 1 }
++	};
++	
++	i2c_transfer(i2c_eep, msg, 2);
++
++	//printk(" tbsecp3-dvb : ecp3_eeprom_read **********%x = %x*******\n",reg,*buf);
++
++	return;
++}
++static void ecp3_eeprom_write(struct i2c_adapter *i2c,u8 reg, u8 data)
++{
++	struct tbsecp3_i2c *i2c_adap = i2c_get_adapdata(i2c);
++	struct tbsecp3_dev *dev = i2c_adap->dev;
++	u8 eeprom_bus_nr = dev->info->eeprom_i2c;
++	struct i2c_adapter *i2c_eep = &dev->i2c_bus[eeprom_bus_nr].i2c_adap;
++	u8 tmp[2] = { reg, data };
++
++	struct i2c_msg msg[] = {
++		{ .addr = 0x50, .flags = 0,
++		  .buf = tmp, .len = 2 },
++	};
++
++	i2c_transfer(i2c_eep, msg, 1);
++	//printk(" ecp3_eeprom_write : ecp3_spi_write **********%x = %x*******\n",reg,buf);
++
++	return ;
++}
++
++static int tbsecp3_set_voltage(struct dvb_frontend* fe,
++		enum fe_sec_voltage voltage)
++{
++	struct sec_priv *priv = fe->sec_priv;
++	struct tbsecp3_gpio_config *cfg = &priv->adap->cfg->gpio;
++	struct tbsecp3_dev *dev = priv->adap->dev;
++
++	dev_dbg(&dev->pci_dev->dev, "%s() %s\n", __func__,
++		voltage == SEC_VOLTAGE_13 ? "SEC_VOLTAGE_13" :
++		voltage == SEC_VOLTAGE_18 ? "SEC_VOLTAGE_18" :
++		"SEC_VOLTAGE_OFF");
++
++	switch (voltage) {
++		case SEC_VOLTAGE_13:
++			tbsecp3_gpio_set_pin(dev, &cfg->lnb_power, 1);
++			tbsecp3_gpio_set_pin(dev, &cfg->lnb_voltage, 0);
++			break;
++		case SEC_VOLTAGE_18:
++			tbsecp3_gpio_set_pin(dev, &cfg->lnb_power, 1);
++			tbsecp3_gpio_set_pin(dev, &cfg->lnb_voltage, 1);
++			break;
++		default: /* OFF */
++			tbsecp3_gpio_set_pin(dev, &cfg->lnb_power, 0);
++			break;
++	}
++
++	if (priv->set_voltage)
++		return priv->set_voltage(fe, voltage);
++	else
++		return 0;
++}
++
++static void tbsecp3_release_sec(struct dvb_frontend* fe)
++{
++	struct sec_priv *priv;
++
++	if (fe == NULL)
++		return;
++
++	priv = fe->sec_priv;
++	if (priv == NULL)
++		return;
++
++	fe->ops.set_voltage = priv->set_voltage;
++	fe->sec_priv = NULL;
++	kfree(priv);
++}
++
++static struct dvb_frontend *tbsecp3_attach_sec(struct tbsecp3_adapter *adap, struct dvb_frontend *fe)
++{
++	struct sec_priv *priv;
++
++	priv = kzalloc(sizeof(struct sec_priv), GFP_KERNEL);
++	if (!priv)
++		return NULL;
++
++	priv->set_voltage = fe->ops.set_voltage;
++	priv->adap = adap;
++
++//	fe->ops.release_sec = tbsecp3_release_sec;
++	fe->ops.set_voltage = tbsecp3_set_voltage;
++	fe->sec_priv = priv;
++
++	return fe;
++}
++
++static int set_mac_address(struct tbsecp3_adapter *adap)
++{
++	struct tbsecp3_dev *dev = adap->dev;
++	u8 eeprom_bus_nr = dev->info->eeprom_i2c;
++	struct i2c_adapter *i2c = &dev->i2c_bus[eeprom_bus_nr].i2c_adap;
++	u8 eep_addr = 0xa0;
++	int ret;
++
++	struct i2c_msg msg[] = {
++		{ .addr = 0x50, .flags = 0,
++		  .buf = &eep_addr, .len = 1 },
++		{ .addr = 0x50, .flags = I2C_M_RD,
++		  .buf = adap->dvb_adapter.proposed_mac, .len = 6 }
++	};
++
++	if (dev->info->eeprom_addr)
++		eep_addr = dev->info->eeprom_addr;
++
++	eep_addr += 0x10 * adap->nr;
++	
++	ret = i2c_transfer(i2c, msg, 2);
++	ret = i2c_transfer(i2c, msg, 2);
++	if (ret != 2) {
++		dev_warn(&dev->pci_dev->dev,
++			"error reading MAC address for adapter %d\n",
++			adap->nr);
++	} else {
++		dev_info(&dev->pci_dev->dev,
++			"MAC address %pM\n", adap->dvb_adapter.proposed_mac);
++	}
++	return 0;
++};
++
++static int start_feed(struct dvb_demux_feed *dvbdmxfeed)
++{
++	struct dvb_demux *dvbdmx = dvbdmxfeed->demux;
++	struct tbsecp3_adapter *adapter = dvbdmx->priv;
++
++	if (!adapter->feeds)
++		tbsecp3_dma_enable(adapter);
++
++	return ++adapter->feeds;
++}
++
++static int stop_feed(struct dvb_demux_feed *dvbdmxfeed)
++{
++	struct dvb_demux *dvbdmx = dvbdmxfeed->demux;
++	struct tbsecp3_adapter *adapter = dvbdmx->priv;
++
++	if (--adapter->feeds)
++		return adapter->feeds;
++
++	tbsecp3_dma_disable(adapter);
++	return 0;
++}
++
++static void reset_demod(struct tbsecp3_adapter *adapter)
++{
++	struct tbsecp3_dev *dev = adapter->dev;
++	struct tbsecp3_gpio_pin *reset = &adapter->cfg->gpio.demod_reset;
++
++	tbsecp3_gpio_set_pin(dev, reset, 1);
++	usleep_range(10000, 20000);
++
++	tbsecp3_gpio_set_pin(dev, reset, 0);
++	usleep_range(50000, 100000);
++}
++
++static struct tas2101_config tbs6910_demod_cfg[] = {
++	{
++		.i2c_address   = 0x68,
++		.id            = ID_TAS2101,
++		.init          = {0x21, 0x43, 0x65, 0xb0, 0xa8, 0x97, 0xb1},
++		.init2         = 0,
++		.write_properties = ecp3_spi_write,  
++		.read_properties = ecp3_spi_read,
++		.write_eeprom = ecp3_eeprom_write, 
++		.read_eeprom = ecp3_eeprom_read,
++	},
++	{
++		.i2c_address   = 0x60,
++		.id            = ID_TAS2101,
++		.init          = {0xb0, 0xa8, 0x21, 0x43, 0x65, 0x97, 0xb1},
++		.init2         = 0,
++		.write_properties = ecp3_spi_write,  
++		.read_properties = ecp3_spi_read,
++		.write_eeprom = ecp3_eeprom_write, 
++		.read_eeprom = ecp3_eeprom_read,
++	},
++};
++
++static struct av201x_config tbs6910_av201x_cfg = {
++	.i2c_address = 0x62,
++	.id          = ID_AV2018,
++	.xtal_freq   = 27000,		/* kHz */
++};
++
++static int tbsecp3_frontend_attach(struct tbsecp3_adapter *adapter)
++{
++	struct tbsecp3_dev *dev = adapter->dev;
++
++	struct i2c_adapter *i2c = &adapter->i2c->i2c_adap;
++
++	adapter->fe = NULL;
++	adapter->fe2 = NULL;
++	adapter->i2c_client_demod = NULL;
++	adapter->i2c_client_tuner = NULL;
++
++	if((TBSECP3_BOARD_TBS6304 != dev->info->board_id) && (TBSECP3_BOARD_TBS6308 != dev->info->board_id) && (TBSECP3_BOARD_TBS6302SE != dev->info->board_id)&&(TBSECP3_BOARD_TBS6209SE != dev->info->board_id)&&(TBSECP3_BOARD_TBS6909SE != dev->info->board_id)&&(TBSECP3_BOARD_TBS6504H!= dev->info->board_id)){
++		reset_demod(adapter);
++		set_mac_address(adapter);
++	}
++
++	switch (dev->info->board_id) {
++	case TBSECP3_BOARD_TBS6910:
++		adapter->fe = dvb_attach(tas2101_attach, &tbs6910_demod_cfg[adapter->nr], i2c);
++		if (adapter->fe == NULL)
++		    goto frontend_atach_fail;
++
++		if (dvb_attach(av201x_attach, adapter->fe, &tbs6910_av201x_cfg,
++			    tas2101_get_i2c_adapter(adapter->fe, 2)) == NULL) {
++		    dvb_frontend_detach(adapter->fe);
++		    adapter->fe = NULL;
++		    dev_err(&dev->pci_dev->dev,
++			    "frontend %d tuner attach failed\n",
++			    adapter->nr);
++		    goto frontend_atach_fail;
++		}
++		if (tbsecp3_attach_sec(adapter, adapter->fe) == NULL) {
++		    dev_warn(&dev->pci_dev->dev,
++			    "error attaching lnb control on adapter %d\n",
++			    adapter->nr);
++		}
++
++		tbsecp3_ca_init(adapter, adapter->nr);
++		break;
++
++	default:
++		dev_warn(&dev->pci_dev->dev, "unknonw card\n");
++		return -ENODEV;
++		break;
++	}
++	strscpy(adapter->fe->ops.info.name,dev->info->name,52);
++	if (adapter->fe2)
++		strscpy(adapter->fe2->ops.info.name,dev->info->name,52);
++	return 0;
++
++frontend_atach_fail:
++	tbsecp3_i2c_remove_clients(adapter);
++	if (adapter->fe != NULL)
++	    dvb_frontend_detach(adapter->fe);
++	adapter->fe = NULL;
++	dev_err(&dev->pci_dev->dev, "TBSECP3 frontend %d attach failed\n",
++		adapter->nr);
++
++	return -ENODEV;
++}
++
++int tbsecp3_dvb_init(struct tbsecp3_adapter *adapter)
++{
++    struct tbsecp3_dev *dev = adapter->dev;
++    struct dvb_adapter *adap = &adapter->dvb_adapter;
++    struct dvb_demux *dvbdemux = &adapter->demux;
++    struct dmxdev *dmxdev;
++    struct dvb_frontend *fe;
++    struct dmx_frontend *fe_hw;
++    struct dmx_frontend *fe_mem;
++    int ret;
++
++    ret = dvb_register_adapter(adap, "TBSECP3 DVB Adapter",
++            THIS_MODULE,
++            &adapter->dev->pci_dev->dev,
++            adapter_nr);
++    if (ret < 0) {
++        dev_err(&dev->pci_dev->dev, "error registering adapter\n");
++        if (ret == -ENFILE)
++            dev_err(&dev->pci_dev->dev,
++                    "increase DVB_MAX_ADAPTERS (%d)\n",
++                    DVB_MAX_ADAPTERS);
++        return ret;
++    }
++
++    adap->priv = adapter;
++    dvbdemux->priv = adapter;
++    dvbdemux->filternum = 256;
++    dvbdemux->feednum = 256;
++    dvbdemux->start_feed = start_feed;
++    dvbdemux->stop_feed = stop_feed;
++    dvbdemux->write_to_decoder = NULL;
++    dvbdemux->dmx.capabilities = (DMX_TS_FILTERING |
++            DMX_SECTION_FILTERING |
++            DMX_MEMORY_BASED_FILTERING);
++
++    ret = dvb_dmx_init(dvbdemux);
++    if (ret < 0) {
++        dev_err(&dev->pci_dev->dev, "dvb_dmx_init failed\n");
++        goto err0;
++    }
++
++    dmxdev = &adapter->dmxdev;
++
++    dmxdev->filternum = 256;
++    dmxdev->demux = &dvbdemux->dmx;
++    dmxdev->capabilities = 0;
++
++    ret = dvb_dmxdev_init(dmxdev, adap);
++    if (ret < 0) {
++        dev_err(&dev->pci_dev->dev, "dvb_dmxdev_init failed\n");
++        goto err1;
++    }
++
++    fe_hw = &adapter->fe_hw;
++    fe_mem = &adapter->fe_mem;
++
++    fe_hw->source = DMX_FRONTEND_0;
++    ret = dvbdemux->dmx.add_frontend(&dvbdemux->dmx, fe_hw);
++    if ( ret < 0) {
++        dev_err(&dev->pci_dev->dev, "dvb_dmx_init failed");
++        goto err2;
++    }
++
++    fe_mem->source = DMX_MEMORY_FE;
++    ret = dvbdemux->dmx.add_frontend(&dvbdemux->dmx, fe_mem);
++    if (ret  < 0) {
++        dev_err(&dev->pci_dev->dev, "dvb_dmx_init failed");
++        goto err3;
++    }
++
++    ret = dvbdemux->dmx.connect_frontend(&dvbdemux->dmx, fe_hw);
++    if (ret < 0) {
++        dev_err(&dev->pci_dev->dev, "dvb_dmx_init failed");
++        goto err4;
++    }
++
++    ret = dvb_net_init(adap, &adapter->dvbnet, adapter->dmxdev.demux);
++    if (ret < 0) {
++        dev_err(&dev->pci_dev->dev, "dvb_net_init failed");
++        goto err5;
++    }
++
++    tbsecp3_frontend_attach(adapter);
++    if (adapter->fe == NULL) {
++        dev_err(&dev->pci_dev->dev, "frontend attach failed\n");
++        ret = -ENODEV;
++        goto err6;
++    }
++
++    if (adapter->fe && adapter->fe2 && swapfe) {
++        fe = adapter->fe;
++        adapter->fe = adapter->fe2;
++        adapter->fe2 = fe;
++    }
++
++    ret = dvb_register_frontend(adap, adapter->fe);
++    if (ret < 0) {
++        dev_err(&dev->pci_dev->dev, "frontend register failed\n");
++        goto err7;
++    }
++
++    if (adapter->fe2 != NULL) {
++        ret = dvb_register_frontend(adap, adapter->fe2);
++        if (ret < 0) {
++            dev_err(&dev->pci_dev->dev, "frontend2 register failed\n");
++        }
++    }
++
++
++    return ret;
++
++err7:
++    dvb_frontend_detach(adapter->fe);
++err6:
++    tbsecp3_release_sec(adapter->fe);
++
++    dvb_net_release(&adapter->dvbnet);
++err5:
++    dvbdemux->dmx.close(&dvbdemux->dmx);
++err4:
++    dvbdemux->dmx.remove_frontend(&dvbdemux->dmx, fe_mem);
++err3:
++    dvbdemux->dmx.remove_frontend(&dvbdemux->dmx, fe_hw);
++err2:
++    dvb_dmxdev_release(dmxdev);
++err1:
++    dvb_dmx_release(dvbdemux);
++err0:
++    dvb_unregister_adapter(adap);
++    return ret;
++}
++
++void tbsecp3_dvb_exit(struct tbsecp3_adapter *adapter)
++{
++    struct dvb_adapter *adap = &adapter->dvb_adapter;
++    struct dvb_demux *dvbdemux = &adapter->demux;
++
++    if (adapter->fe) {
++        tbsecp3_ca_release(adapter);
++        dvb_unregister_frontend(adapter->fe);
++        tbsecp3_release_sec(adapter->fe);
++        dvb_frontend_detach(adapter->fe);
++        adapter->fe = NULL;
++
++        if (adapter->fe2 != NULL) {
++            dvb_unregister_frontend(adapter->fe2);
++            tbsecp3_release_sec(adapter->fe2);
++            dvb_frontend_detach(adapter->fe2);
++            adapter->fe2 = NULL;
++        }
++    }
++    dvb_net_release(&adapter->dvbnet);
++    dvbdemux->dmx.close(&dvbdemux->dmx);
++    dvbdemux->dmx.remove_frontend(&dvbdemux->dmx, &adapter->fe_mem);
++    dvbdemux->dmx.remove_frontend(&dvbdemux->dmx, &adapter->fe_hw);
++    dvb_dmxdev_release(&adapter->dmxdev);
++    dvb_dmx_release(&adapter->demux);
++    dvb_unregister_adapter(adap);
++}
+diff -urN linux.orig/drivers/media/pci/tbsecp3/tbsecp3.h linux/drivers/media/pci/tbsecp3/tbsecp3.h
+--- linux.orig/drivers/media/pci/tbsecp3/tbsecp3.h	1970-01-01 01:00:00.000000000 +0100
++++ linux/drivers/media/pci/tbsecp3/tbsecp3.h	2024-08-04 19:53:33.612091581 +0100
+@@ -0,0 +1,258 @@
++/*
++    TBS ECP3 FPGA based cards PCIe driver
++
++    This program is free software: you can redistribute it and/or modify
++    it under the terms of the GNU General Public License as published by
++    the Free Software Foundation, either version 3 of the License, or
++    (at your option) any later version.
++
++    This program is distributed in the hope that it will be useful,
++    but WITHOUT ANY WARRANTY; without even the implied warranty of
++    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++    GNU General Public License for more details.
++
++    You should have received a copy of the GNU General Public License
++    along with this program.  If not, see <http://www.gnu.org/licenses/>.
++*/
++
++#ifndef _TBSECP3_H_
++#define _TBSECP3_H_
++
++#include <linux/i2c.h>
++#include <linux/init.h>
++#include <linux/interrupt.h>
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/proc_fs.h>
++#include <linux/pci.h>
++#include <linux/dma-mapping.h>
++#include <linux/slab.h>
++
++#include <media/dmxdev.h>
++#include <media/dvbdev.h>
++#include <media/dvb_demux.h>
++#include <media/dvb_frontend.h>
++#include <media/dvb_ringbuffer.h>
++#include <media/dvb_ca_en50221.h>
++#include <media/dvb_net.h>
++
++#include "tbsecp3-regs.h"
++
++#define TBSECP3_VID		0x544d
++#define TBSECP3_PID		0x6178
++
++#define TBSECP3_BOARD_TBS6205 	0
++#define TBSECP3_BOARD_TBS6281SE	1
++#define TBSECP3_BOARD_TBS6290SE	2
++#define TBSECP3_BOARD_TBS6209	3
++#define TBSECP3_BOARD_TBS6522 	4
++#define TBSECP3_BOARD_TBS6528	5
++#define TBSECP3_BOARD_TBS6590	6
++#define TBSECP3_BOARD_TBS6902	7
++#define TBSECP3_BOARD_TBS6903	8
++#define TBSECP3_BOARD_TBS6904	9
++#define TBSECP3_BOARD_TBS6905	10
++#define TBSECP3_BOARD_TBS6908	11
++#define TBSECP3_BOARD_TBS6909	12
++#define TBSECP3_BOARD_TBS6910	13
++#define TBSECP3_BOARD_TBS6704   14
++#define TBSECP3_BOARD_TBS6814	15
++#define TBSECP3_BOARD_TBS6514	16
++#define TBSECP3_BOARD_TBS690a	17
++#define TBSECP3_BOARD_TBS6301	18
++#define TBSECP3_BOARD_TBS6304	19
++#define TBSECP3_BOARD_TBS6308	20
++#define TBSECP3_BOARD_TBS6903X	21
++#define TBSECP3_BOARD_TBS6909X	22
++#define TBSECP3_BOARD_TBS6904X 	23
++#define TBSECP3_BOARD_TBS6912 	24
++#define TBSECP3_BOARD_TBS6504	25
++#define TBSECP3_BOARD_TBS6508	26
++#define TBSECP3_BOARD_TBS6302SE	27
++#define TBSECP3_BOARD_TBS6902SE 28
++#define TBSECP3_BOARD_TBS6904SE 29
++#define TBSECP3_BOARD_TBS6301SE 30
++#define TBSECP3_BOARD_TBS6910SE 31
++#define TBSECP3_BOARD_TBS7901   32
++#define TBSECP3_BOARD_TBS6209SE 33
++#define TBSECP3_BOARD_TBS7230 34
++#define TBSECP3_BOARD_TBS6302X 35
++#define TBSECP3_BOARD_TBS6302T 36
++#define TBSECP3_BOARD_TBS6304X	37
++#define TBSECP3_BOARD_TBS6290TD	38
++#define TBSECP3_BOARD_TBS6281TD	39
++#define TBSECP3_BOARD_TBS6205SE	40
++#define TBSECP3_BOARD_TBS6909SE	41
++#define TBSECP3_BOARD_TBS6304T	42
++#define TBSECP3_BOARD_TBS6522H	43
++#define TBSECP3_BOARD_TBS6504H	44
++#define TBSECP3_BOARD_TBS6590SE	45
++#define TBSECP3_BOARD_TBS6308X	46
++#define TBSECP3_BOARD_TBS6916	47
++#define TBSECP3_BOARD_TBS6312X	48
++
++
++#define TBSECP3_MAX_ADAPTERS	(16)
++#define TBSECP3_MAX_I2C_BUS	(4)
++
++#define TBSECP3_GPIODEF_NONE	(0)
++#define TBSECP3_GPIODEF_HIGH	(1)
++#define TBSECP3_GPIODEF_LOW	(2)
++
++#define TBSECP3_DMA_BUFFERS	16
++#define TBSECP3_DMA_PRE_BUFFERS	2
++
++
++struct tbsecp3_dev;
++
++
++struct tbsecp3_gpio_pin {
++	u8 lvl;
++	u8 nr;
++};
++
++struct tbsecp3_gpio_config {
++	struct tbsecp3_gpio_pin lnb_power;
++	struct tbsecp3_gpio_pin lnb_voltage;
++	struct tbsecp3_gpio_pin demod_reset;
++};
++
++struct tbsecp3_adap_config {
++        u32 ts_in;
++	u8 i2c_bus_nr;
++	struct tbsecp3_gpio_config gpio;
++};
++
++struct tbsecp3_board {
++	u16  board_id;
++	char *name;
++	int adapters;
++	u32 i2c_speed;
++	u8 eeprom_i2c;
++	u8 eeprom_addr;
++	struct tbsecp3_adap_config adap_config[16];
++};
++
++struct tbsecp3_i2c {
++	struct tbsecp3_dev *dev;
++	u32 base;
++
++	struct i2c_adapter i2c_adap;
++	struct i2c_client i2c_client;
++
++	struct mutex lock;
++	wait_queue_head_t wq;
++	bool done;
++};
++
++struct tbsecp3_dma_channel {
++	u32 base;
++	dma_addr_t dma_addr;
++	u32 page_size;
++	u32 buffer_size;
++	u32 buffer_pkts;
++	u8 *buf[TBSECP3_DMA_BUFFERS + 1];
++	u8 offset;
++	u8 cnt;
++	u8 next_buffer;
++};
++
++struct tbsecp3_ca {
++	int nr;
++	u32 base;
++	struct dvb_ca_en50221 ca;
++
++	struct tbsecp3_adapter *adapter;
++	struct mutex lock;
++	int status;
++};
++
++struct tbsecp3_adapter {
++	int nr;
++	struct tbsecp3_adap_config *cfg;
++
++	/* parent device */
++	struct tbsecp3_dev *dev;
++
++	/* i2c */
++	struct tbsecp3_i2c *i2c;
++	struct i2c_client *i2c_client_demod;
++	struct i2c_client *i2c_client_tuner;
++
++	/* dvb */
++	struct dvb_adapter dvb_adapter;
++	struct dvb_frontend *fe;
++	struct dvb_frontend *fe2;
++	struct dvb_frontend _fe2;
++	struct dvb_demux demux;
++	struct dmxdev dmxdev;
++	struct dvb_net dvbnet;
++	struct dmx_frontend fe_hw;
++	struct dmx_frontend fe_mem;
++	int feeds;
++
++	/* dma */
++	spinlock_t adap_lock;
++	struct tasklet_struct tasklet;
++	struct tbsecp3_dma_channel dma;
++
++	/* ca interface */
++	struct tbsecp3_ca *tbsca;
++};
++
++struct tbsecp3_dev {
++	struct tbsecp3_board *info;
++
++	/* pcie */
++	struct pci_dev *pci_dev;
++	void __iomem *lmmio;
++	bool msi;
++
++	/* dvb adapters */
++	struct tbsecp3_adapter adapter[TBSECP3_MAX_ADAPTERS];
++
++	/* i2c */
++	struct tbsecp3_i2c i2c_bus[TBSECP3_MAX_I2C_BUS];
++	
++	u8 mac_num;
++};
++
++#define tbs_read(_b, _o)	readl(dev->lmmio + (_b + _o))
++#define tbs_write(_b, _o, _v)	writel((_v), dev->lmmio + (_b + _o))
++
++
++/* tbsecp3-core.c */
++void tbsecp3_gpio_set_pin(struct tbsecp3_dev *dev,
++			  struct tbsecp3_gpio_pin *pin, int state);
++
++/* tbspcie-i2c.c */
++extern int tbsecp3_i2c_init(struct tbsecp3_dev *dev);
++extern void tbsecp3_i2c_exit(struct tbsecp3_dev *dev);
++extern void tbsecp3_i2c_reg_init(struct tbsecp3_dev *dev);
++extern void tbsecp3_i2c_remove_clients(struct tbsecp3_adapter *adapter);
++
++/* tbspcie-cards.c */
++extern struct tbsecp3_board tbsecp3_boards[];
++
++/* tbspcie-dvb.c */
++extern int tbsecp3_dvb_init(struct tbsecp3_adapter *adapter);
++extern void tbsecp3_dvb_exit(struct tbsecp3_adapter *adapter);
++
++/* tbsecp3-asi.c */
++extern u8 asi_CheckFree(struct tbsecp3_dev *dev,int asi_base_addr, unsigned char OpbyteNum);
++extern bool asi_chip_reset(struct tbsecp3_dev *dev,int asi_base_addr);
++extern int asi_read16bit(struct tbsecp3_dev *dev,int asi_base_addr,int reg_addr);
++extern bool asi_write16bit(struct tbsecp3_dev *dev,int asi_base_addr, int reg_addr, int data16bit);
++
++/* tbsecp3-dma.c */
++extern int tbsecp3_dma_init(struct tbsecp3_dev *dev);
++extern void tbsecp3_dma_free(struct tbsecp3_dev *dev);
++extern void tbsecp3_dma_reg_init(struct tbsecp3_dev *dev);
++extern void tbsecp3_dma_enable(struct tbsecp3_adapter *adap);
++extern void tbsecp3_dma_disable(struct tbsecp3_adapter *adap);
++
++/* tbsecp3-ca.c */
++int tbsecp3_ca_init(struct tbsecp3_adapter *adap, int nr);
++void tbsecp3_ca_release(struct tbsecp3_adapter *adap);
++
++#endif
+diff -urN linux.orig/drivers/media/pci/tbsecp3/tbsecp3-i2c.c linux/drivers/media/pci/tbsecp3/tbsecp3-i2c.c
+--- linux.orig/drivers/media/pci/tbsecp3/tbsecp3-i2c.c	1970-01-01 01:00:00.000000000 +0100
++++ linux/drivers/media/pci/tbsecp3/tbsecp3-i2c.c	2024-08-04 19:53:33.612091581 +0100
+@@ -0,0 +1,217 @@
++/*
++    TBS ECP3 FPGA based cards PCIe driver
++
++    This program is free software: you can redistribute it and/or modify
++    it under the terms of the GNU General Public License as published by
++    the Free Software Foundation, either version 3 of the License, or
++    (at your option) any later version.
++
++    This program is distributed in the hope that it will be useful,
++    but WITHOUT ANY WARRANTY; without even the implied warranty of
++    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++    GNU General Public License for more details.
++
++    You should have received a copy of the GNU General Public License
++    along with this program.  If not, see <http://www.gnu.org/licenses/>.
++*/
++
++#include "tbsecp3.h"
++
++union tbsecp3_i2c_ctrl {
++	struct {
++		u32 ctrl;
++		u32 data;
++	} raw;
++	struct {
++		u8 size:4;
++		u8 saddr:2;
++		u8 stop:1;
++		u8 start:1;
++		u8 read:1;
++		u8 addr:7;
++		u8 buf[6];
++	} bits;
++};
++
++static int i2c_xfer(struct i2c_adapter *adapter, struct i2c_msg *msg, int num)
++{
++	struct tbsecp3_i2c *bus = i2c_get_adapdata(adapter);
++	struct tbsecp3_dev *dev = bus->dev;
++	union tbsecp3_i2c_ctrl i2c_ctrl;
++	int i, j, retval;
++	u16 len, remaining, xfer_max;
++	u8 *b;
++
++	mutex_lock(&bus->lock);
++	//clear the i2c status	
++	tbs_read(bus->base, 0x00);
++
++	for (i = 0; i < num; i++) {
++
++		b = msg[i].buf;
++		remaining = msg[i].len;
++
++		i2c_ctrl.raw.ctrl = 0;
++		i2c_ctrl.bits.start = 1;
++		i2c_ctrl.bits.addr = msg[i].addr;
++		
++		if (msg[i].flags & I2C_M_RD) {
++			i2c_ctrl.bits.read = 1;
++			xfer_max = 4;
++		} else {
++			xfer_max = 6;
++		}
++
++		do {
++			if (remaining <= xfer_max)
++				i2c_ctrl.bits.stop = 1;
++
++			len = remaining > xfer_max ? xfer_max : remaining;
++			i2c_ctrl.bits.size = len;
++
++			if (!(msg[i].flags & I2C_M_RD)) {
++				for (j = 0; j < len; j++)
++					i2c_ctrl.bits.buf[j] = *b++;
++				tbs_write(bus->base, TBSECP3_I2C_DATA, i2c_ctrl.raw.data);
++			}
++			bus->done = 0;
++			tbs_write(bus->base, TBSECP3_I2C_CTRL, i2c_ctrl.raw.ctrl);
++			retval = wait_event_timeout(bus->wq, bus->done == 1, HZ);
++			if (retval == 0) {
++				tbs_read(bus->base, TBSECP3_I2C_STAT); // restore iic to its original state
++				dev_err(&dev->pci_dev->dev, "i2c xfer timeout\n");
++				retval = -EIO;
++				goto i2c_xfer_exit;
++			}
++
++			j = tbs_read(bus->base, TBSECP3_I2C_CTRL);
++			if (j & 0x04) {
++				dev_err(&dev->pci_dev->dev, "i2c nack (%x)\n", j);
++				retval = -EIO;
++				goto i2c_xfer_exit;
++			}
++
++			if (msg[i].flags & I2C_M_RD) {
++				i2c_ctrl.raw.data = tbs_read(bus->base, TBSECP3_I2C_DATA);
++				memcpy(b, &i2c_ctrl.raw.data, len);
++				b += len;
++			}
++			
++			i2c_ctrl.bits.start = 0;
++			remaining -= len;
++		} while (remaining);
++
++	}	
++	retval = num;
++i2c_xfer_exit:
++	mutex_unlock(&bus->lock);
++	return retval;
++}
++
++static u32 i2c_functionality(struct i2c_adapter *adap)
++{
++	return I2C_FUNC_SMBUS_EMUL;
++}
++
++struct i2c_algorithm tbsecp3_i2c_algo_template = {
++	.master_xfer   = i2c_xfer,
++	.functionality = i2c_functionality,
++};
++
++static int tbsecp3_i2c_register(struct tbsecp3_i2c *bus)
++{
++	struct tbsecp3_dev *dev = bus->dev;
++	struct i2c_adapter *adap;
++
++	init_waitqueue_head(&bus->wq);
++	mutex_init(&bus->lock);
++
++	adap = &bus->i2c_adap;
++	strcpy(adap->name, "tbsecp3");
++	adap->algo = &tbsecp3_i2c_algo_template;
++	adap->algo_data = (void*) bus;
++	adap->dev.parent = &dev->pci_dev->dev;
++	adap->owner = THIS_MODULE;
++	
++	strcpy(bus->i2c_client.name, "tbsecp3cli");
++	bus->i2c_client.adapter = adap;
++
++	i2c_set_adapdata(&bus->i2c_adap, bus);
++	return i2c_add_adapter(&bus->i2c_adap);
++}
++
++static void tbsecp3_i2c_unregister(struct tbsecp3_i2c *bus)
++{
++	i2c_del_adapter(&bus->i2c_adap);
++}
++
++/* ----------------------------------------------------------------------- */
++
++void tbsecp3_i2c_remove_clients(struct tbsecp3_adapter *adapter)
++{
++#if 0
++	struct i2c_client *client_demod, *client_tuner;
++
++	/* remove tuner I2C client */
++	client_tuner = adapter->i2c_client_tuner;
++	if (client_tuner) {
++		module_put(client_tuner->dev.driver->owner);
++		i2c_unregister_device(client_tuner);
++		adapter->i2c_client_tuner = NULL;
++	}
++
++	/* remove demodulator I2C client */
++	client_demod = adapter->i2c_client_demod;
++	if (client_demod) {
++		module_put(client_demod->dev.driver->owner);
++		i2c_unregister_device(client_demod);
++		adapter->i2c_client_demod = NULL;
++	}
++#endif
++}
++
++void tbsecp3_i2c_reg_init(struct tbsecp3_dev *dev)
++{
++	int i;
++	u32 baud = dev->info->i2c_speed;
++
++	/* default to 400kbps */
++	if (!baud)
++		baud = 9;
++
++	for (i = 0; i < 4; i++) {
++		tbs_write(dev->i2c_bus[i].base, TBSECP3_I2C_BAUD, baud);
++		tbs_read(dev->i2c_bus[i].base, TBSECP3_I2C_STAT);
++		tbs_write(TBSECP3_INT_BASE, TBSECP3_I2C_IE(i), 1);
++	}
++}
++
++int tbsecp3_i2c_init(struct tbsecp3_dev *dev)
++{
++	int i, ret = 0;
++
++	/* I2C Defaults / setup */
++	for (i = 0; i < 4; i++) {
++		dev->i2c_bus[i].base = TBSECP3_I2C_BASE(i);
++		dev->i2c_bus[i].dev = dev;
++		ret = tbsecp3_i2c_register(&dev->i2c_bus[i]);
++		if (ret)
++			break;
++	}
++	if (ret) {
++		do {
++			tbsecp3_i2c_unregister(&dev->i2c_bus[i]);
++		} while (i-- > 0);
++	} else {
++		tbsecp3_i2c_reg_init(dev);
++	}
++	return ret;
++}
++
++void tbsecp3_i2c_exit(struct tbsecp3_dev *dev)
++{
++	int i;
++	for (i = 0; i < 4; i++)
++		tbsecp3_i2c_unregister(&dev->i2c_bus[i]);
++}
++
+diff -urN linux.orig/drivers/media/pci/tbsecp3/tbsecp3-regs.h linux/drivers/media/pci/tbsecp3/tbsecp3-regs.h
+--- linux.orig/drivers/media/pci/tbsecp3/tbsecp3-regs.h	1970-01-01 01:00:00.000000000 +0100
++++ linux/drivers/media/pci/tbsecp3/tbsecp3-regs.h	2024-08-04 19:53:33.612091581 +0100
+@@ -0,0 +1,86 @@
++/*
++    TBS ECP3 FPGA based cards PCIe driver
++
++    This program is free software: you can redistribute it and/or modify
++    it under the terms of the GNU General Public License as published by
++    the Free Software Foundation, either version 3 of the License, or
++    (at your option) any later version.
++
++    This program is distributed in the hope that it will be useful,
++    but WITHOUT ANY WARRANTY; without even the implied warranty of
++    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++    GNU General Public License for more details.
++
++    You should have received a copy of the GNU General Public License
++    along with this program.  If not, see <http://www.gnu.org/licenses/>.
++*/
++
++#ifndef _TBSECP3_REGS_H_
++#define _TBSECP3_REGS_H_
++
++/* GPIO */
++#define TBSECP3_GPIO_BASE	0x0000
++
++#define TBSECP3_GPIO_PIN(_bank, _pin)	(((_bank) << 5) + _pin)
++
++/* I2C */
++#define TBSECP3_I2C_BASE(_n)	(0x4000 + 0x1000 * _n)
++#define TBSECP3_I2C_STAT	0x0000
++#define TBSECP3_I2C_CTRL	0x0000
++#define TBSECP3_I2C_DATA	0x0004
++#define TBSECP3_I2C_BAUD	0x0008
++
++/* CA */
++#define TBSECP3_CA_BASE(_n)	(0x6000 + 0x1000 * _n)
++
++/* DMA */
++//#define TBSECP3_DMA_BASE(_n)	(_n < 4) ? (0x8000 + 0x1000 * _n) : (0x8800 + 0x1000 * (_n - 4))
++#define TBSECP3_DMA_BASE(_n)	(_n<8)?((_n < 4) ? (0x8000 + 0x1000 * _n) : (0x8800 + 0x1000 * (_n - 4))):  \
++								((_n < 12) ? (0x8400 + 0x1000 *( _n - 8)) : (0x8C00 + 0x1000 * (_n - 12)))
++#define TBSECP3_DMA_STAT	0x0000
++#define TBSECP3_DMA_EN		0x0000
++#define TBSECP3_DMA_TSIZE	0x0004
++#define TBSECP3_DMA_ADDRH	0x0008
++#define TBSECP3_DMA_ADDRL	0x000c
++#define TBSECP3_DMA_BSIZE	0x0010
++
++/* INTR */
++#define TBSECP3_INT_BASE	0xc000
++#define TBSECP3_INT_STAT	0x0000
++#define TBSECP3_INT_EN		0x0004
++#define TBSECP3_I2C_IE(_n)	(0x0008 + 4 * _n)
++#define TBSECP3_DMA_IE(_n)	(0x0018 + 4 * _n)
++#define TBSECP3_I2C_IF(_n)	(0x0001 << _n)
++#define TBSECP3_DMA_IF(_n)	(0x0010 << _n)
++#define TBSECP3_DMA_IF1(_n) 	(0x1000<<(_n-8))
++//spi flash
++#define SPI_CONFIG      	 0x10
++#define SPI_STATUS      	 0x10
++#define SPI_COMMAND     	 0x14
++#define SPI_WT_DATA     	 0x18
++#define SPI_RD_DATA     	 0x1c
++#define SPI_ENABLE       	 0x1c
++
++/* ASI */ 
++#define ASI0_BASEADDRESS  0x4000
++#define ASI_CHIP_RST  	0x00
++#define ASI_SPI_CONFIG  0x04
++#define ASI_SPI_CMD  	0x08
++#define ASI_SPI_WT_32  	0x0c
++#define ASI_SPI_ENABLE  0x10
++
++#define ASI_STATUS  	0x00
++#define ASI_SPI_RD_32   0x04
++
++//-------------24cXX --------------------------------------------------------
++#define BASE_ADDRESS_24CXX  	0x4000
++#define CMD_24CXX	      0*4   //write only
++#define DATA0_24CXX       1*4   //W/R
++#define DATA1_24CXX       2*4   //W/R
++#define CS_RELEASE        3*4   //write only
++
++#define STATUS_MAC16_24CXX	 0*4   //read only
++#define MAC32_24CXX	 		 3*4   //read only
++//---------------------------------------------------------------------
++
++#endif
+diff -urN linux.orig/drivers/media/tuners/av201x.c linux/drivers/media/tuners/av201x.c
+--- linux.orig/drivers/media/tuners/av201x.c	1970-01-01 01:00:00.000000000 +0100
++++ linux/drivers/media/tuners/av201x.c	2024-08-04 19:57:57.473992434 +0100
+@@ -0,0 +1,302 @@
++/*
++ * AV201x Airoha Technology silicon tuner driver
++ *
++ * Copyright (C) 2014 Luis Alves <ljalvs@gmail.com>
++ *
++ *    This program is free software; you can redistribute it and/or modify
++ *    it under the terms of the GNU General Public License as published by
++ *    the Free Software Foundation; either version 2 of the License, or
++ *    (at your option) any later version.
++ *
++ *    This program is distributed in the hope that it will be useful,
++ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
++ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ *    GNU General Public License for more details.
++ *
++ *    You should have received a copy of the GNU General Public License along
++ *    with this program; if not, write to the Free Software Foundation, Inc.,
++ *    51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
++ */
++
++#include "av201x.h"
++#include "av201x_priv.h"
++
++/* write multiple (continuous) registers */
++static int av201x_wrm(struct av201x_priv *priv, u8 *buf, int len)
++{
++	int ret;
++	struct i2c_msg msg = {
++		.addr = priv->cfg->i2c_address,
++		.flags = 0, .buf = buf, .len = len };
++
++	dev_dbg(&priv->i2c->dev, "%s() i2c wrm @0x%02x (len=%d) ",
++		__func__, buf[0], len);
++
++	ret = i2c_transfer(priv->i2c, &msg, 1);
++	if (ret < 0) {
++		dev_warn(&priv->i2c->dev,
++			"%s: i2c wrm err(%i) @0x%02x (len=%d)\n",
++			KBUILD_MODNAME, ret, buf[0], len);
++		return ret;
++	}
++	return 0;
++}
++
++/* write one register */
++static int av201x_wr(struct av201x_priv *priv, u8 addr, u8 data)
++{
++	u8 buf[] = { addr, data };
++	return av201x_wrm(priv, buf, 2);
++}
++
++/* read multiple (continuous) registers starting at addr */
++static int av201x_rdm(struct av201x_priv *priv, u8 addr, u8 *buf, int len)
++{
++	int ret;
++	struct i2c_msg msg[] = {
++		{ .addr = priv->cfg->i2c_address, .flags = 0,
++			.buf = &addr, .len = 1 },
++		{ .addr = priv->cfg->i2c_address, .flags = I2C_M_RD,
++			.buf = buf, .len = len }
++	};
++
++	dev_dbg(&priv->i2c->dev, "%s() i2c rdm @0x%02x (len=%d)\n",
++		__func__, addr, len);
++
++	ret = i2c_transfer(priv->i2c, msg, 2);
++	if (ret < 0) {
++		dev_warn(&priv->i2c->dev,
++			"%s: i2c rdm err(%i) @0x%02x (len=%d)\n",
++			KBUILD_MODNAME, ret, addr, len);
++		return ret;
++	}
++	return 0;
++}
++
++/* read one register */
++static int av201x_rd(struct av201x_priv *priv, u8 addr, u8 *data)
++{
++	return av201x_rdm(priv, addr, data, 1);
++}
++
++/* read register, apply masks, write back */
++static int av201x_regmask(struct av201x_priv *priv,
++	u8 reg, u8 setmask, u8 clrmask)
++{
++	int ret;
++	u8 b = 0;
++	if (clrmask != 0xff) {
++		ret = av201x_rd(priv, reg, &b);
++		if (ret)
++			return ret;
++		b &= ~clrmask;
++	}
++	return av201x_wr(priv, reg, b | setmask);
++}
++
++static int av201x_wrtable(struct av201x_priv *priv,
++	struct av201x_regtable *regtable, int len)
++{
++	int ret, i;
++
++	for (i = 0; i < len; i++) {
++		ret = av201x_regmask(priv, regtable[i].addr,
++			regtable[i].setmask, regtable[i].clrmask);
++		if (ret)
++			return ret;
++		if (regtable[i].sleep)
++			msleep(regtable[i].sleep);
++	}
++	return 0;
++}
++
++static void av201x_release(struct dvb_frontend *fe)
++{
++	struct av201x_priv *priv = fe->tuner_priv;
++	dev_dbg(&priv->i2c->dev, "%s()\n", __func__);
++
++	kfree(fe->tuner_priv);
++	fe->tuner_priv = NULL;
++}
++
++static int av201x_init(struct dvb_frontend *fe)
++{
++	struct av201x_priv *priv = fe->tuner_priv;
++	int ret;
++	dev_dbg(&priv->i2c->dev, "%s()\n", __func__);
++
++	ret = av201x_wrtable(priv, av201x_inittuner0,
++		ARRAY_SIZE(av201x_inittuner0));
++
++	switch (priv->cfg->id) {
++	case ID_AV2011:
++		ret |= av201x_wrtable(priv, av201x_inittuner1a,
++			ARRAY_SIZE(av201x_inittuner1a));
++		break;
++	case ID_AV2012:
++	default:
++		ret |= av201x_wrtable(priv, av201x_inittuner1b,
++			ARRAY_SIZE(av201x_inittuner1b));
++		break;
++	}
++
++	ret |= av201x_wrtable(priv, av201x_inittuner2,
++		ARRAY_SIZE(av201x_inittuner2));
++
++	ret |= av201x_wr(priv, REG_TUNER_CTRL, 0x96);
++
++	msleep(120);
++
++	if (ret)
++		dev_dbg(&priv->i2c->dev, "%s() failed\n", __func__);
++	return ret;
++}
++
++static int av201x_sleep(struct dvb_frontend *fe)
++{
++	struct av201x_priv *priv = fe->tuner_priv;
++	int ret;
++	dev_dbg(&priv->i2c->dev, "%s()\n", __func__);
++
++	ret = av201x_regmask(priv, REG_TUNER_CTRL, AV201X_SLEEP, 0);
++	if (ret)
++		dev_dbg(&priv->i2c->dev, "%s() failed\n", __func__);
++	return ret;
++}
++
++static int av201x_set_params(struct dvb_frontend *fe)
++{
++	struct av201x_priv *priv = fe->tuner_priv;
++	struct dtv_frontend_properties *c = &fe->dtv_property_cache;
++	u32 n, bw, bf;
++	u8 buf[5];
++	int ret;
++
++	dev_dbg(&priv->i2c->dev, "%s() delivery_system=%d frequency=%d " \
++			"symbol_rate=%d\n", __func__,
++			c->delivery_system, c->frequency, c->symbol_rate);
++
++	/*
++	   ** PLL setup **
++	   RF = (pll_N * ref_freq) / pll_M
++	   pll_M = fixed 0x10000
++	   PLL output is divided by 2
++	   REG_FN = pll_M<24:0>
++	*/
++	buf[0] = REG_FN;
++	n = DIV_ROUND_CLOSEST(c->frequency, priv->cfg->xtal_freq);
++	buf[1] = (n > 0xff) ? 0xff : (u8) n;
++	n = DIV_ROUND_CLOSEST((c->frequency / 1000) << 17, priv->cfg->xtal_freq / 1000);
++	buf[2] = (u8) (n >> 9);
++	buf[3] = (u8) (n >> 1);
++	buf[4] = (u8) (((n << 7) & 0x80) | 0x50);
++	ret = av201x_wrm(priv, buf, 5);
++	if (ret)
++		goto exit;
++
++	msleep(20);
++
++	/* set bandwidth */
++	bw = (c->symbol_rate / 1000) * 135/200;
++	if (c->symbol_rate < 6500000)
++		bw += 6000;
++	bw += 2000;
++	bw *= 108/100;
++
++	/* check limits (4MHz < bw < 40MHz) */
++	if (bw > 40000)
++		bw = 40000;
++	else if (bw < 4000)
++		bw = 4000;
++
++	/* bandwidth step = 211kHz */
++	bf = DIV_ROUND_CLOSEST(bw * 127, 21100);
++	ret = av201x_wr(priv, REG_BWFILTER, (u8) bf);
++
++	/* enable fine tune agc */
++	ret |= av201x_wr(priv, REG_FT_CTRL, AV201X_FT_EN | AV201X_FT_BLK);
++
++	ret |= av201x_wr(priv, REG_TUNER_CTRL, 0x96);
++	msleep(20);
++exit:
++	if (ret)
++		dev_dbg(&priv->i2c->dev, "%s() failed\n", __func__);
++	return ret;
++}
++
++static  int   AV201x_agc         [] = {     0,  82,   100,  116,  140,  162,  173,  187,  210,  223,  254,  255};
++static  int   AV201x_level_dBm_10[] = {    90, -50,  -263, -361, -463, -563, -661, -761, -861, -891, -904, -910};
++
++static int av201x_get_rf_strength(struct dvb_frontend *fe, u16 *st)
++{
++	struct av201x_priv *priv = fe->tuner_priv;
++	struct dtv_frontend_properties *c = &fe->dtv_property_cache;
++	int   if_agc, index, table_length, slope, *x, *y;
++
++	if_agc = *st;
++	x = AV201x_agc;
++	y = AV201x_level_dBm_10;
++	table_length = sizeof(AV201x_agc)/sizeof(int);
++
++	
++	/* Finding in which segment the if_agc value is */
++	for (index = 0; index < table_length; index ++)
++		if (x[index] > if_agc ) break;
++
++	/* Computing segment slope */
++	slope =  ((y[index]-y[index-1])*1000)/(x[index]-x[index-1]);
++	/* Linear approximation of rssi value in segment (rssi values will be in 0.1dBm unit: '-523' means -52.3 dBm) */
++	*st = 1000 + ((y[index-1] + ((if_agc - x[index-1])*slope + 500)/1000))/10;
++
++	c->strength.len = 1;
++	c->strength.stat[0].scale = FE_SCALE_DECIBEL;
++	c->strength.stat[0].svalue = ((y[index-1] + ((if_agc - x[index-1])*slope + 500)/1000)) * 100;
++
++	return 0;
++}
++
++
++static const struct dvb_tuner_ops av201x_tuner_ops = {
++	.info = {
++		.name           = "Airoha Technology AV201x",
++		.frequency_min_hz = 850 * MHz,
++		.frequency_max_hz = 2300 * MHz,
++	},
++
++	.release = av201x_release,
++
++	.init = av201x_init,
++	.sleep = av201x_sleep,
++	.set_params = av201x_set_params,
++	.get_rf_strength = av201x_get_rf_strength,
++};
++
++struct dvb_frontend *av201x_attach(struct dvb_frontend *fe,
++		struct av201x_config *cfg, struct i2c_adapter *i2c)
++{
++	struct av201x_priv *priv = NULL;
++
++	priv = kzalloc(sizeof(struct av201x_priv), GFP_KERNEL);
++	if (priv == NULL) {
++		dev_dbg(&i2c->dev, "%s() attach failed\n", __func__);
++		return NULL;
++	}
++
++	priv->cfg = cfg;
++	priv->i2c = i2c;
++
++	dev_info(&priv->i2c->dev,
++		"%s: Airoha Technology AV201x successfully attached\n",
++		KBUILD_MODNAME);
++
++	memcpy(&fe->ops.tuner_ops, &av201x_tuner_ops,
++			sizeof(struct dvb_tuner_ops));
++
++	fe->tuner_priv = priv;
++	return fe;
++}
++EXPORT_SYMBOL_GPL(av201x_attach);
++
++MODULE_DESCRIPTION("Airoha Technology AV201x silicon tuner driver");
++MODULE_AUTHOR("Luis Alves <ljalvs@gmail.com>");
++MODULE_LICENSE("GPL");
+diff -urN linux.orig/drivers/media/tuners/av201x.h linux/drivers/media/tuners/av201x.h
+--- linux.orig/drivers/media/tuners/av201x.h	1970-01-01 01:00:00.000000000 +0100
++++ linux/drivers/media/tuners/av201x.h	2024-08-04 19:57:57.477992462 +0100
+@@ -0,0 +1,55 @@
++/*
++ * AV201x Airoha Technology silicon tuner driver
++ *
++ * Copyright (C) 2014 Luis Alves <ljalvs@gmail.com>
++ *
++ *    This program is free software; you can redistribute it and/or modify
++ *    it under the terms of the GNU General Public License as published by
++ *    the Free Software Foundation; either version 2 of the License, or
++ *    (at your option) any later version.
++ *
++ *    This program is distributed in the hope that it will be useful,
++ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
++ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ *    GNU General Public License for more details.
++ *
++ *    You should have received a copy of the GNU General Public License along
++ *    with this program; if not, write to the Free Software Foundation, Inc.,
++ *    51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
++ */
++
++#ifndef AV201X_H
++#define AV201X_H
++
++#include <linux/kconfig.h>
++#include <media/dvb_frontend.h>
++
++typedef enum av201x_id {
++	ID_AV2011,
++	ID_AV2012,
++	ID_AV2018,
++} av201x_id_t;
++
++struct av201x_config {
++	/* tuner i2c address */
++	u8 i2c_address;
++	/* tuner type */
++	av201x_id_t id;
++
++	/* crystal freq in kHz */
++	u32 xtal_freq;
++};
++
++#if IS_REACHABLE(CONFIG_MEDIA_TUNER_AV201X)
++extern struct dvb_frontend *av201x_attach(struct dvb_frontend *fe,
++		struct av201x_config *cfg, struct i2c_adapter *i2c);
++#else
++static inline struct dvb_frontend *av201x_attach(struct dvb_frontend *fe,
++		struct av201x_config *cfg, struct i2c_adapter *i2c)
++{
++	printk(KERN_WARNING "%s: driver disabled by Kconfig\n", __func__);
++	return NULL;
++}
++#endif
++
++#endif /* AV201X_H */
+diff -urN linux.orig/drivers/media/tuners/av201x_priv.h linux/drivers/media/tuners/av201x_priv.h
+--- linux.orig/drivers/media/tuners/av201x_priv.h	1970-01-01 01:00:00.000000000 +0100
++++ linux/drivers/media/tuners/av201x_priv.h	2024-08-04 19:58:03.590036051 +0100
+@@ -0,0 +1,110 @@
++/*
++ * AV201x Airoha Technology silicon tuner driver
++ *
++ * Copyright (C) 2014 Luis Alves <ljalvs@gmail.com>
++ *
++ *    This program is free software; you can redistribute it and/or modify
++ *    it under the terms of the GNU General Public License as published by
++ *    the Free Software Foundation; either version 2 of the License, or
++ *    (at your option) any later version.
++ *
++ *    This program is distributed in the hope that it will be useful,
++ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
++ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ *    GNU General Public License for more details.
++ *
++ *    You should have received a copy of the GNU General Public License along
++ *    with this program; if not, write to the Free Software Foundation, Inc.,
++ *    51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
++ */
++
++#ifndef AV201X_PRIV_H
++#define AV201X_PRIV_H
++
++struct av201x_priv {
++	struct av201x_config *cfg;
++	struct i2c_adapter *i2c;
++};
++
++enum av201x_regs_addr {
++	REG_FN		= 0x00,
++	REG_BWFILTER	= 0x05,
++	REG_TUNER_STAT	= 0x0b,
++	REG_TUNER_CTRL	= 0x0c,
++	REG_FT_CTRL	= 0x25,
++};
++
++/* REG_TUNER_STAT */
++#define AV201X_PLLLOCK		(1<<0)
++
++/* REG_TUNER_CTRL */
++#define AV201X_SLEEP		(1<<5)
++#define AV201X_RFLP		(1<<6)
++
++/* REG_FT_CTRL */
++#define AV201X_FT_EN		(1<<1)
++#define AV201X_FT_BLK		(1<<2)
++
++struct av201x_regtable {
++	u8 addr;
++	u8 setmask;
++	u8 clrmask;
++	int sleep;
++};
++
++static struct av201x_regtable av201x_inittuner0[] = {
++	{0x00, 0x38, 0xff, 0},
++	{0x01, 0x00, 0xff, 0},
++	{0x02, 0x00, 0xff, 0},
++	{0x03, 0x50, 0xff, 0},
++	{0x04, 0x1f, 0xff, 0},
++	{0x05, 0xa3, 0xff, 0},
++	{0x06, 0xfd, 0xff, 0},
++	{0x07, 0x58, 0xff, 0},
++	{0x08, 0x36, 0xff, 0},
++	{0x09, 0xc2, 0xff, 0},
++	{0x0a, 0x88, 0xff, 0},
++	{0x0b, 0xb4, 0xff, 20},
++	{0x0d, 0x40, 0xff, 0},
++};
++
++static struct av201x_regtable av201x_inittuner1a[] = {
++	{0x0e, 0x94, 0xff, 0},
++	{0x0f, 0x9a, 0xff, 0},
++};
++
++static struct av201x_regtable av201x_inittuner1b[] = {
++	{0x0e, 0x5b, 0xff, 0},
++	{0x0f, 0x6a, 0xff, 0},
++};
++
++static struct av201x_regtable av201x_inittuner2[] = {
++	{0x10, 0x66, 0xff, 0},
++	{0x11, 0x40, 0xff, 0},
++	{0x12, 0x80, 0xff, 0},
++	{0x13, 0x2b, 0xff, 0},
++	{0x14, 0x6a, 0xff, 0},
++	{0x15, 0x50, 0xff, 0},
++	{0x16, 0x91, 0xff, 0},
++	{0x17, 0x27, 0xff, 0},
++	{0x18, 0x8f, 0xff, 0},
++	{0x19, 0xcc, 0xff, 0},
++	{0x1a, 0x21, 0xff, 0},
++	{0x1b, 0x10, 0xff, 0},
++	{0x1c, 0x80, 0xff, 0},
++	{0x1d, 0x02, 0xff, 0},
++	{0x1e, 0xf5, 0xff, 0},
++	{0x1f, 0x7f, 0xff, 0},
++	{0x20, 0x4a, 0xff, 0},
++	{0x21, 0x9b, 0xff, 0},
++	{0x22, 0xe0, 0xff, 0},
++	{0x23, 0xe0, 0xff, 0},
++	{0x24, 0x36, 0xff, 0},
++	{0x25, 0x00, 0xff, 0},
++	{0x26, 0xab, 0xff, 0},
++	{0x27, 0x97, 0xff, 0},
++	{0x28, 0xc5, 0xff, 0},
++	{0x29, 0xa8, 0xff, 20},
++};
++
++#endif /* AV201X_PRIV_H */
+diff -urN linux.orig/drivers/media/tuners/Kconfig linux/drivers/media/tuners/Kconfig
+--- linux.orig/drivers/media/tuners/Kconfig	2024-08-04 19:51:34.763243706 +0100
++++ linux/drivers/media/tuners/Kconfig	2024-08-04 19:58:51.042373853 +0100
+@@ -297,4 +297,11 @@
+ 	  This device is only used inside a SiP called together with a
+ 	  demodulator for now.
+ 
++config MEDIA_TUNER_AV201X
++	tristate "Airoha Technology AV201x silicon tuner"
++	depends on MEDIA_SUPPORT && I2C
++	default m if !MEDIA_SUBDRV_AUTOSELECT
++	help
++	  Airoha Technology AV201x silicon tuner driver.
++
+ endmenu
+diff -urN linux.orig/drivers/media/tuners/Makefile linux/drivers/media/tuners/Makefile
+--- linux.orig/drivers/media/tuners/Makefile	2024-08-04 19:51:34.763243706 +0100
++++ linux/drivers/media/tuners/Makefile	2024-08-04 19:58:30.982231178 +0100
+@@ -46,3 +46,4 @@
+ obj-$(CONFIG_MEDIA_TUNER_XC2028) += xc2028.o
+ obj-$(CONFIG_MEDIA_TUNER_XC4000) += xc4000.o
+ obj-$(CONFIG_MEDIA_TUNER_XC5000) += xc5000.o
++obj-$(CONFIG_MEDIA_TUNER_AV201X) += av201x.o
+diff -urN linux.orig/include/media/dvb_frontend.h linux/include/media/dvb_frontend.h
+--- linux.orig/include/media/dvb_frontend.h	2024-08-04 19:52:10.291498073 +0100
++++ linux/include/media/dvb_frontend.h	2024-08-04 20:35:48.485976457 +0100
+@@ -497,6 +497,12 @@
+ 
+ 	struct dvb_tuner_ops tuner_ops;
+ 	struct analog_demod_ops analog_ops;
++
++	void(*spi_read)( struct dvb_frontend *fe,struct ecp3_info *ecp3inf);
++	void(*spi_write)( struct dvb_frontend *fe,struct ecp3_info *ecp3inf);
++
++	void(*eeprom_read)( struct dvb_frontend *fe,struct eeprom_info *peepinf);
++	void(*eeprom_write)( struct dvb_frontend *fe,struct eeprom_info *peepinf);
+ };
+ 
+ #ifdef __DVB_CORE__
+@@ -628,6 +634,7 @@
+ 
+ 	/* Multistream specifics */
+ 	u32			stream_id;
++	u32			modcode;
+ 
+ 	/* Physical Layer Scrambling specifics */
+ 	u32			scrambling_sequence_index;
+diff -urN linux.orig/include/uapi/linux/dvb/frontend.h linux/include/uapi/linux/dvb/frontend.h
+--- linux.orig/include/uapi/linux/dvb/frontend.h	2024-08-04 19:52:13.355519972 +0100
++++ linux/include/uapi/linux/dvb/frontend.h	2024-08-04 20:35:00.677631099 +0100
+@@ -1057,4 +1057,22 @@
+ 
+ #endif
+ 
++struct ecp3_info
++{
++	__u8 reg;
++	__u32 data;
++};
++
++struct eeprom_info
++{
++	__u8 reg;
++	__u8 data;
++};
++
++#define FE_ECP3FW_READ    _IOR('o', 90, struct ecp3_info)
++#define FE_ECP3FW_WRITE   _IOW('o', 91, struct ecp3_info)
++
++#define FE_EEPROM_READ    _IOR('o', 96, struct eeprom_info)
++#define FE_EEPROM_WRITE   _IOW('o', 97, struct eeprom_info)
++
+ #endif /*_DVBFRONTEND_H_*/
